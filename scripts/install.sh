@@ -58,7 +58,11 @@ log "System packages updated"
 # ── Install Node.js ───────────────────────────────────────────
 if ! command -v node &>/dev/null || [[ $(node -v | cut -d'v' -f2 | cut -d'.' -f1) -lt 18 ]]; then
   step "Installing Node.js $NODE_VERSION..."
-  curl -fsSL https://deb.nodesource.com/setup_${NODE_VERSION}.x | bash - &>/dev/null
+  if [ "$OS" = "debian" ]; then
+    curl -fsSL https://deb.nodesource.com/setup_${NODE_VERSION}.x | bash - &>/dev/null
+  else
+    curl -fsSL https://rpm.nodesource.com/setup_${NODE_VERSION}.x | bash - &>/dev/null
+  fi
   $PKG install -y -q nodejs
   log "Node.js $(node -v) installed"
 else
@@ -114,12 +118,14 @@ log "Panel code downloaded to $PANEL_DIR"
 step "Writing environment config..."
 SESSION_SECRET=$(openssl rand -hex 32)
 
+mkdir -p "$PANEL_DIR"
 cat > "$PANEL_DIR/.env" << EOF
 DATABASE_URL=postgresql://$DB_USER:$DB_PASSWORD@localhost:5432/$DB_NAME
 SESSION_SECRET=$SESSION_SECRET
 NODE_ENV=production
 EOF
 
+mkdir -p "$PANEL_DIR/artifacts/api-server"
 cat > "$PANEL_DIR/artifacts/api-server/.env" << EOF
 PORT=$API_PORT
 DATABASE_URL=postgresql://$DB_USER:$DB_PASSWORD@localhost:5432/$DB_NAME
@@ -127,6 +133,7 @@ SESSION_SECRET=$SESSION_SECRET
 NODE_ENV=production
 EOF
 
+mkdir -p "$PANEL_DIR/artifacts/cph-panel"
 cat > "$PANEL_DIR/artifacts/cph-panel/.env" << EOF
 PORT=$WEB_PORT
 VITE_API_BASE=/api
@@ -162,7 +169,14 @@ PORT=$WEB_PORT pnpm --filter @workspace/cph-panel run build
 log "Frontend built"
 
 # ── Nginx (optional) ──────────────────────────────────────────
-if command -v nginx &>/dev/null || apt-get install -y -q nginx &>/dev/null; then
+if ! command -v nginx &>/dev/null; then
+  if [ "$OS" = "debian" ]; then
+    apt-get install -y -q nginx &>/dev/null
+  else
+    yum install -y -q nginx &>/dev/null
+  fi
+fi
+if command -v nginx &>/dev/null; then
   step "Configuring Nginx reverse proxy..."
   cat > /etc/nginx/sites-available/cph-panel << 'NGINX'
 server {
