@@ -1,996 +1,176 @@
 #!/bin/bash
-# =============================================================================
-# CPH PANEL — Self-Extracting Installer
-# Version: 1.0.0
-# Install: bash <(curl -s https://raw.githubusercontent.com/Amir565-ux/cph-panel/main/scripts/install.sh)
-#
-# AI-EDITABLE STRUCTURE:
-#   Each source file is embedded below as a clearly labelled heredoc section.
-#   Search for "## FILE:" to jump to any file. Edit between the heredoc markers.
-#   After editing, re-run this script — it extracts and rebuilds everything.
-#
-# SECTIONS IN ORDER:
-#   1. Config & helpers
-#   2. System setup (Node, PostgreSQL, Nginx, PM2)
-#   3. FILE: backend/src/schema.ts         — Database table definition
-#   4. FILE: backend/src/db.ts             — Drizzle ORM connection
-#   5. FILE: backend/src/routes/health.ts  — Health check route
-#   6. FILE: backend/src/routes/vps.ts     — VPS CRUD + action routes
-#   7. FILE: backend/src/routes/dashboard.ts — Stats + resource usage routes
-#   8. FILE: backend/src/routes/index.ts   — Route registry
-#   9. FILE: backend/src/app.ts            — Express app setup
-#  10. FILE: backend/src/index.ts          — Server entry point
-#  11. FILE: backend/package.json          — Backend dependencies
-#  12. FILE: backend/tsconfig.json         — TypeScript config
-#  13. FILE: frontend/src/index.css        — Global styles
-#  14. FILE: frontend/src/pages/Dashboard.tsx — Main dashboard page
-#  15. FILE: frontend/src/App.tsx          — React app root
-#  16. FILE: frontend/src/main.tsx         — React entry point
-#  17. FILE: frontend/index.html           — HTML shell
-#  18. FILE: frontend/package.json         — Frontend dependencies
-#  19. FILE: frontend/vite.config.ts       — Vite build config
-#  20. Build & start
-# =============================================================================
-
-# ── Colors ─────────────────────────────────────────────────────────────────
-RED='\033[0;31m'; GREEN='\033[0;32m'; YELLOW='\033[1;33m'
-BLUE='\033[0;34m'; BOLD='\033[1m'; NC='\033[0m'
-
-# ── Config (AI: edit these defaults if needed) ──────────────────────────────
-PANEL_DIR="${PANEL_DIR:-/opt/cph-panel}"
-API_PORT="${API_PORT:-5000}"
-PANEL_PORT="${PANEL_PORT:-80}"
-DB_NAME="cph_panel"
-DB_USER="cph_panel"
-# Safe password generation — uses /dev/urandom, no openssl dependency
-DB_PASS="${DB_PASS:-$(tr -dc 'a-f0-9' < /dev/urandom 2>/dev/null | head -c 32 || echo "cphpanel$(date +%s)")}"
-NODE_VERSION="20"
-
-log_info()  { echo -e "${GREEN}[INFO]${NC}  $1"; }
-log_warn()  { echo -e "${YELLOW}[WARN]${NC}  $1"; }
-log_error() { echo -e "${RED}[ERROR]${NC} $1"; }
-log_step()  { echo -e "\n${BLUE}${BOLD}==> $1${NC}"; }
-
-die() { log_error "$1"; exit 1; }
-
-run() {
-  "$@" || { log_error "Command failed: $*"; exit 1; }
-}
-
-banner() {
-  echo -e "${BLUE}${BOLD}"
-  echo "   ██████╗██████╗ ██╗  ██╗    ██████╗  █████╗ ███╗   ██╗███████╗██╗     "
-  echo "  ██╔════╝██╔══██╗██║  ██║    ██╔══██╗██╔══██╗████╗  ██║██╔════╝██║     "
-  echo "  ██║     ██████╔╝███████║    ██████╔╝███████║██╔██╗ ██║█████╗  ██║     "
-  echo "  ██║     ██╔═══╝ ██╔══██║    ██╔═══╝ ██╔══██║██║╚██╗██║██╔══╝  ██║     "
-  echo "  ╚██████╗██║     ██║  ██║    ██║     ██║  ██║██║ ╚████║███████╗███████╗"
-  echo "   ╚═════╝╚═╝     ╚═╝  ╚═╝    ╚═╝     ╚═╝  ╚═╝╚═╝  ╚═══╝╚══════╝╚══════╝"
-  echo -e "${NC}${BOLD}   VPS Hosting Control Panel  v1.0.0${NC}\n"
-}
-
-check_root() {
-  if [[ $EUID -ne 0 ]]; then
-    log_error "This script must be run as root."
-    echo -e "  Re-run with: ${BOLD}sudo bash \$0${NC}"
-    echo -e "  Or switch to root first: ${BOLD}sudo su -${NC}"
-    exit 1
-  fi
-}
-
-detect_os() {
-  if [[ -f /etc/os-release ]]; then
-    . /etc/os-release
-    log_info "Detected OS: ${PRETTY_NAME:-$ID $VERSION_ID}"
-  else
-    log_warn "Could not detect OS — assuming Debian/Ubuntu-compatible"
-  fi
-}
-
-service_cmd() {
-  # Handles both systemctl (VPS) and service (containers/Codespaces)
-  local action="$1" svc="$2"
-  if command -v systemctl &>/dev/null && systemctl is-system-running &>/dev/null 2>&1; then
-    systemctl "$action" "$svc" 2>/dev/null || true
-  else
-    service "$svc" "$action" 2>/dev/null || true
-  fi
-}
-
-install_system_deps() {
-  log_step "Installing system dependencies"
-
-  # Yeh variable set karta hai takay apt-get koi interactive question na pooche
-  export DEBIAN_FRONTEND=noninteractive
-
-  # Package list ko refresh karta hai — server se latest package names laata hai
-  apt-get update -qq 2>&1 | tail -3
-
-  # Ye sab zaroori programs install karta hai:
-  #   curl/wget  = internet se files download karne ke liye
-  #   git        = code manage karne ke liye
-  #   build-essential = C/C++ tools jo Node.js compile karne lagte hain
-  #   openssl    = secure passwords aur SSL certificates banane ke liye
-  #   postgresql = database server — panel ka data yahan store hota hai
-  #   nginx      = web server — browser se requests leke backend ko bhejta hai
-  apt-get install -y -qq curl wget git build-essential openssl postgresql postgresql-contrib nginx 2>&1 | tail -5
-
-  log_step "Installing Node.js $NODE_VERSION"
-
-  # Check karta hai ke Node.js pehle se installed hai ya nahi
-  # Agar nahi hai ya purana version hai to install karta hai
-  if ! command -v node &>/dev/null || [[ "$(node -v | cut -d. -f1 | tr -d 'v')" -lt "$NODE_VERSION" ]]; then
-
-    # NodeSource ka official script download karke chalata hai
-    # Yeh script apt-get mein Node.js ka sahi source add karta hai
-    curl -fsSL https://deb.nodesource.com/setup_${NODE_VERSION}.x | bash -
-
-    # Ab Node.js install karta hai us source se jo upar add kiya
-    apt-get install -y -q nodejs
-  fi
-
-  log_step "Installing pnpm + pm2"
-
-  # pnpm = fast package manager, Node.js dependencies install karne ke liye
-  # pm2  = process manager, backend server ko background mein chalata hai aur crash pe restart karta hai
-  npm install -g pnpm pm2 --silent
-}
-
-setup_postgres() {
-  log_step "Setting up PostgreSQL"
-
-  # PostgreSQL service shuru karta hai
-  # systemctl = normal VPS par, service = containers/Codespaces mein
-  service_cmd start postgresql
-
-  # Boot pe automatically start hone ke liye enable karta hai (sirf systemctl environments mein)
-  service_cmd enable postgresql
-
-  # PostgreSQL ke tayar hone ka intezaar karta hai — kabhi kabhi start hone mein waqt lagta hai
-  local retries=0
-  until su - postgres -c "psql -c 'SELECT 1' &>/dev/null" 2>/dev/null || [[ $retries -ge 10 ]]; do
-    log_info "Waiting for PostgreSQL to be ready... ($retries/10)"
-    # 2 second ruko phir dobara check karo
-    sleep 2
-    ((retries++))
-  done
-
-  # Agar service command se start nahi hua to pg_ctlcluster try karta hai (Debian ka alternative)
-  if ! su - postgres -c "psql -c 'SELECT 1' &>/dev/null" 2>/dev/null; then
-    # Installed PostgreSQL version dhundta hai
-    PG_VERSION=$(ls /etc/postgresql/ 2>/dev/null | sort -V | tail -1)
-    if [[ -n "$PG_VERSION" ]]; then
-      # Directly cluster start karta hai version number ke saath
-      pg_ctlcluster "$PG_VERSION" main start 2>/dev/null || true
-      sleep 2
-    fi
-  fi
-
-  # Agar panel ka database user pehle se nahi hai to banata hai
-  su - postgres -c "psql -tc \"SELECT 1 FROM pg_user WHERE usename='$DB_USER'\" 2>/dev/null | grep -q 1 \
-    || psql -c \"CREATE USER $DB_USER WITH PASSWORD '$DB_PASS'\" 2>/dev/null" 2>/dev/null || true
-
-  # User ka password update karta hai (agar pehle se tha to bhi update ho jata hai)
-  su - postgres -c "psql -c \"ALTER USER $DB_USER WITH PASSWORD '$DB_PASS'\" 2>/dev/null" 2>/dev/null || true
-
-  # Agar panel ka database pehle se nahi hai to banata hai aur user ko owner banata hai
-  su - postgres -c "psql -tc \"SELECT 1 FROM pg_database WHERE datname='$DB_NAME'\" 2>/dev/null | grep -q 1 \
-    || psql -c \"CREATE DATABASE $DB_NAME OWNER $DB_USER\" 2>/dev/null" 2>/dev/null || true
-
-  # DATABASE_URL variable set karta hai — backend is URL se database se connect karta hai
-  DATABASE_URL="postgresql://$DB_USER:$DB_PASS@localhost:5432/$DB_NAME"
-  log_info "Database ready: $DB_NAME"
-}
-
-# =============================================================================
-# FILE EXTRACTION
-# Each write_file call embeds the full content of one source file.
-# AI: find the file you want to change, edit between the HEREDOC markers.
-# =============================================================================
-
-write_file() {
-  local path="$1"
-  mkdir -p "$(dirname "$PANEL_DIR/$path")"
-  cat > "$PANEL_DIR/$path"
-}
-
-extract_files() {
-  log_step "Extracting panel source files"
-
-# ── ## FILE: backend/src/schema.ts ─────────────────────────────────────────
-# AI: Edit this to add/remove database columns for the vps table.
-# After editing, the migration runs automatically via drizzle-kit push.
-write_file "backend/src/schema.ts" << 'HEREDOC'
-import { pgTable, serial, text, integer, real, timestamp } from "drizzle-orm/pg-core";
-
-export const vpsTable = pgTable("vps", {
-  id:         serial("id").primaryKey(),
-  name:       text("name").notNull(),
-  status:     text("status").notNull().default("stopped"),
-  cpuCores:   integer("cpu_cores").notNull(),
-  ramGb:      real("ram_gb").notNull(),
-  storageGb:  real("storage_gb").notNull(),
-  ipAddress:  text("ip_address").notNull().default(""),
-  os:         text("os").notNull(),
-  location:   text("location"),
-  cpuUsage:   real("cpu_usage").notNull().default(0),
-  ramUsage:   real("ram_usage").notNull().default(0),
-  createdAt:  timestamp("created_at").notNull().defaultNow(),
-});
-
-export type Vps = typeof vpsTable.$inferSelect;
-export type InsertVps = typeof vpsTable.$inferInsert;
-HEREDOC
-
-# ── ## FILE: backend/src/db.ts ──────────────────────────────────────────────
-# AI: Database connection. DATABASE_URL is set by the installer automatically.
-write_file "backend/src/db.ts" << 'HEREDOC'
-import { drizzle } from "drizzle-orm/node-postgres";
-import pg from "pg";
-import * as schema from "./schema.js";
-
-if (!process.env.DATABASE_URL) throw new Error("DATABASE_URL not set");
-
-const pool = new pg.Pool({ connectionString: process.env.DATABASE_URL });
-export const db = drizzle(pool, { schema });
-export * from "./schema.js";
-HEREDOC
-
-# ── ## FILE: backend/src/routes/health.ts ──────────────────────────────────
-# AI: Simple health check. Returns { status: "ok" }. Used by uptime monitors.
-write_file "backend/src/routes/health.ts" << 'HEREDOC'
-import { Router } from "express";
-const r = Router();
-r.get("/healthz", (_req, res) => res.json({ status: "ok" }));
-export default r;
-HEREDOC
-
-# ── ## FILE: backend/src/routes/vps.ts ────────────────────────────────────
-# AI: All VPS CRUD endpoints + action endpoint (start/stop/suspend/reboot).
-# Endpoints: GET /vps, POST /vps, GET /vps/:id, PATCH /vps/:id,
-#            DELETE /vps/:id, POST /vps/:id/action
-write_file "backend/src/routes/vps.ts" << 'HEREDOC'
-import { Router } from "express";
-import { db, vpsTable } from "../db.js";
-import { eq } from "drizzle-orm";
-
-const r = Router();
-
-const fmt = (v: typeof vpsTable.$inferSelect) => ({
-  ...v,
-  createdAt: v.createdAt instanceof Date ? v.createdAt.toISOString() : v.createdAt,
-});
-
-r.get("/vps", async (req, res) => {
-  try {
-    res.json((await db.select().from(vpsTable).orderBy(vpsTable.id)).map(fmt));
-  } catch (e) { res.status(500).json({ error: String(e) }); }
-});
-
-r.post("/vps", async (req, res) => {
-  const { name, cpuCores, ramGb, storageGb, os, location, ipAddress } = req.body;
-  if (!name || !cpuCores || !ramGb || !storageGb || !os)
-    return void res.status(400).json({ error: "Missing required fields" });
-  try {
-    const [row] = await db.insert(vpsTable).values({
-      name, cpuCores: Number(cpuCores), ramGb: Number(ramGb),
-      storageGb: Number(storageGb), os,
-      location: location ?? null,
-      ipAddress: ipAddress ?? `10.0.${Math.floor(Math.random()*255)}.${Math.floor(Math.random()*254)+1}`,
-      status: "stopped", cpuUsage: 0, ramUsage: 0,
-    }).returning();
-    res.status(201).json(fmt(row));
-  } catch (e) { res.status(500).json({ error: String(e) }); }
-});
-
-r.get("/vps/:id", async (req, res) => {
-  try {
-    const [row] = await db.select().from(vpsTable).where(eq(vpsTable.id, Number(req.params.id)));
-    row ? res.json(fmt(row)) : res.status(404).json({ error: "Not found" });
-  } catch (e) { res.status(500).json({ error: String(e) }); }
-});
-
-r.patch("/vps/:id", async (req, res) => {
-  const { name, os, location } = req.body;
-  try {
-    const [row] = await db.update(vpsTable).set({ name, os, location })
-      .where(eq(vpsTable.id, Number(req.params.id))).returning();
-    row ? res.json(fmt(row)) : res.status(404).json({ error: "Not found" });
-  } catch (e) { res.status(500).json({ error: String(e) }); }
-});
-
-r.delete("/vps/:id", async (req, res) => {
-  try {
-    const [row] = await db.delete(vpsTable).where(eq(vpsTable.id, Number(req.params.id))).returning();
-    row ? res.status(204).send() : res.status(404).json({ error: "Not found" });
-  } catch (e) { res.status(500).json({ error: String(e) }); }
-});
-
-r.post("/vps/:id/action", async (req, res) => {
-  const { action } = req.body;
-  const validActions = ["start", "stop", "suspend", "reboot"];
-  if (!validActions.includes(action))
-    return void res.status(400).json({ error: "Invalid action" });
-
-  const statusMap: Record<string, string> = {
-    start: "running", stop: "stopped", suspend: "suspended", reboot: "running",
-  };
-  const usageMap: Record<string, { cpuUsage: number; ramUsage: number }> = {
-    start:   { cpuUsage: Math.random()*40+10, ramUsage: Math.random()*40+20 },
-    stop:    { cpuUsage: 0, ramUsage: 0 },
-    suspend: { cpuUsage: 0, ramUsage: 5 },
-    reboot:  { cpuUsage: Math.random()*30+5, ramUsage: Math.random()*30+15 },
-  };
-  try {
-    const [row] = await db.update(vpsTable)
-      .set({ status: statusMap[action], ...usageMap[action] })
-      .where(eq(vpsTable.id, Number(req.params.id))).returning();
-    row ? res.json(fmt(row)) : res.status(404).json({ error: "Not found" });
-  } catch (e) { res.status(500).json({ error: String(e) }); }
-});
-
-export default r;
-HEREDOC
-
-# ── ## FILE: backend/src/routes/dashboard.ts ──────────────────────────────
-# AI: Dashboard stats + resource usage history endpoints.
-# /api/dashboard/stats    → totals and status counts
-# /api/dashboard/resource-usage → last 10 data points of cpu/ram usage
-write_file "backend/src/routes/dashboard.ts" << 'HEREDOC'
-import { Router } from "express";
-import { db, vpsTable } from "../db.js";
-
-const r = Router();
-
-r.get("/dashboard/stats", async (_req, res) => {
-  try {
-    const rows = await db.select().from(vpsTable);
-    res.json({
-      totalVps:       rows.length,
-      totalCpuCores:  rows.reduce((s, v) => s + v.cpuCores, 0),
-      totalRamGb:     Math.round(rows.reduce((s, v) => s + v.ramGb, 0) * 10) / 10,
-      totalStorageGb: Math.round(rows.reduce((s, v) => s + v.storageGb, 0) * 10) / 10,
-      runningCount:   rows.filter(v => v.status === "running").length,
-      stoppedCount:   rows.filter(v => v.status === "stopped").length,
-      suspendedCount: rows.filter(v => v.status === "suspended").length,
-    });
-  } catch (e) { res.status(500).json({ error: String(e) }); }
-});
-
-r.get("/dashboard/resource-usage", async (_req, res) => {
-  try {
-    const rows = await db.select().from(vpsTable);
-    const running = rows.filter(v => v.status === "running");
-    const avgCpu = running.length ? running.reduce((s, v) => s + (v.cpuUsage ?? 0), 0) / running.length : 0;
-    const avgRam = running.length ? running.reduce((s, v) => s + (v.ramUsage ?? 0), 0) / running.length : 0;
-
-    const now = Date.now();
-    const jitter = () => (Math.random() - 0.5) * 8;
-    const history = Array.from({ length: 10 }, (_, i) => {
-      const t = new Date(now - (9 - i) * 6 * 60 * 1000);
-      return {
-        time: t.toLocaleTimeString("en-US", { hour: "2-digit", minute: "2-digit", hour12: false }),
-        cpuUsage: Math.max(0, Math.min(100, avgCpu + jitter())),
-        ramUsage: Math.max(0, Math.min(100, avgRam + jitter())),
-      };
-    });
-    res.json({ history });
-  } catch (e) { res.status(500).json({ error: String(e) }); }
-});
-
-export default r;
-HEREDOC
-
-# ── ## FILE: backend/src/routes/index.ts ──────────────────────────────────
-# AI: Register new routers here by importing and adding router.use(yourRouter).
-write_file "backend/src/routes/index.ts" << 'HEREDOC'
-import { Router } from "express";
-import health    from "./health.js";
-import vps       from "./vps.js";
-import dashboard from "./dashboard.js";
-
-const router = Router();
-router.use(health);
-router.use(vps);
-router.use(dashboard);
-export default router;
-HEREDOC
-
-# ── ## FILE: backend/src/app.ts ────────────────────────────────────────────
-# AI: Express app. Add global middleware here (auth, rate-limiting, etc.)
-write_file "backend/src/app.ts" << 'HEREDOC'
-import express from "express";
-import cors    from "cors";
-import router  from "./routes/index.js";
-
-const app = express();
-app.use(cors());
-app.use(express.json());
-app.use(express.urlencoded({ extended: true }));
-app.use("/api", router);
-export default app;
-HEREDOC
-
-# ── ## FILE: backend/src/index.ts ─────────────────────────────────────────
-# AI: Entry point. Reads PORT env var and starts the server.
-write_file "backend/src/index.ts" << 'HEREDOC'
-import app from "./app.js";
-const port = Number(process.env.PORT ?? 5000);
-app.listen(port, () => console.log(`[cph-api] Listening on :${port}`));
-HEREDOC
-
-# ── ## FILE: backend/package.json ─────────────────────────────────────────
-# AI: Add backend npm packages here, then re-run the installer.
-write_file "backend/package.json" << 'HEREDOC'
-{
-  "name": "cph-panel-api",
-  "version": "1.0.0",
-  "type": "module",
-  "scripts": {
-    "build": "tsc",
-    "start": "node dist/index.js",
-    "dev":   "tsx watch src/index.ts"
-  },
-  "dependencies": {
-    "cors": "^2.8.5",
-    "drizzle-orm": "^0.41.0",
-    "express": "^5.0.1",
-    "pg": "^8.13.0"
-  },
-  "devDependencies": {
-    "@types/cors":    "^2.8.17",
-    "@types/express": "^5.0.0",
-    "@types/node":    "^22.0.0",
-    "@types/pg":      "^8.11.10",
-    "drizzle-kit":    "^0.31.0",
-    "tsx":            "^4.19.0",
-    "typescript":     "^5.7.0"
-  }
-}
-HEREDOC
-
-# ── ## FILE: backend/tsconfig.json ────────────────────────────────────────
-write_file "backend/tsconfig.json" << 'HEREDOC'
-{
-  "compilerOptions": {
-    "target": "ES2022",
-    "module": "NodeNext",
-    "moduleResolution": "NodeNext",
-    "outDir": "./dist",
-    "rootDir": "./src",
-    "strict": true,
-    "esModuleInterop": true,
-    "skipLibCheck": true
-  },
-  "include": ["src"]
-}
-HEREDOC
-
-# ── ## FILE: backend/drizzle.config.ts ────────────────────────────────────
-write_file "backend/drizzle.config.ts" << 'HEREDOC'
-import type { Config } from "drizzle-kit";
-export default {
-  schema: "./src/schema.ts",
-  dialect: "postgresql",
-  dbCredentials: { url: process.env.DATABASE_URL! },
-} satisfies Config;
-HEREDOC
-
-# ── ## FILE: frontend/src/index.css ───────────────────────────────────────
-# AI: Global styles. Theme: black bg, white text, blue (#2563eb) for buttons only.
-write_file "frontend/src/index.css" << 'HEREDOC'
-* { box-sizing: border-box; margin: 0; padding: 0; }
-body {
-  background: #000;
-  color: #fff;
-  font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
-  -webkit-font-smoothing: antialiased;
-}
-HEREDOC
-
-# ── ## FILE: frontend/src/pages/Dashboard.tsx ─────────────────────────────
-# AI: The main dashboard page. Contains:
-#   - StatCard component  → edit to change the 4 top stat cards
-#   - CustomTooltip       → chart tooltip style
-#   - PieTooltip          → donut chart tooltip
-#   - Dashboard()         → main render, contains navbar, stats, charts, status strip
-#
-# COLOR GUIDE (AI: search these hex values to change colors):
-#   #2563eb  → blue  (navbar icon, admin avatar — the "blue only" rule)
-#   #22c55e  → green (running VPS status)
-#   #52525b  → grey  (stopped VPS status)
-#   #f59e0b  → amber (suspended VPS status)
-#   #3b82f6  → blue  (CPU line in resource chart)
-#   #0f0f0f  → card background
-#   rgba(255,255,255,0.08) → card border
-#
-# API calls use plain fetch() to /api/dashboard/stats and /api/dashboard/resource-usage.
-# No external state library needed — uses React's built-in hooks.
-write_file "frontend/src/pages/Dashboard.tsx" << 'HEREDOC'
-import { useEffect, useState } from "react";
-import { PieChart, Pie, Cell, ResponsiveContainer, LineChart, Line, XAxis, YAxis, Tooltip, CartesianGrid } from "recharts";
-
-// ── Types ────────────────────────────────────────────────────────────────
-interface Stats {
-  totalVps: number; totalCpuCores: number; totalRamGb: number; totalStorageGb: number;
-  runningCount: number; stoppedCount: number; suspendedCount: number;
-}
-interface UsagePoint { time: string; cpuUsage: number; ramUsage: number; }
-
-// ── Colors (AI: change these to retheme the entire panel) ────────────────
-const CLR = { blue: "#2563eb", green: "#22c55e", grey: "#52525b", amber: "#f59e0b", cpu: "#3b82f6" };
-
-// ── Stat Card ─────────────────────────────────────────────────────────────
-function StatCard({ label, value, sub, icon }: { label: string; value: string|number; sub?: string; icon: string }) {
-  return (
-    <div style={{ background:"#0f0f0f", border:"1px solid rgba(255,255,255,0.08)", borderRadius:12, padding:16, display:"flex", flexDirection:"column", gap:12 }}>
-      <div style={{ display:"flex", alignItems:"center", justifyContent:"space-between" }}>
-        <span style={{ fontSize:11, fontWeight:600, letterSpacing:"0.1em", textTransform:"uppercase", color:"rgba(255,255,255,0.35)" }}>{label}</span>
-        <div style={{ width:30, height:30, borderRadius:8, background:"rgba(255,255,255,0.05)", display:"flex", alignItems:"center", justifyContent:"center", fontSize:15 }}>{icon}</div>
-      </div>
-      <div style={{ fontSize:28, fontWeight:700, color:"#fff", lineHeight:1 }}>{value}</div>
-      {sub && <div style={{ fontSize:11, color:"rgba(255,255,255,0.25)" }}>{sub}</div>}
-    </div>
-  );
-}
-
-// ── Tooltips ──────────────────────────────────────────────────────────────
-const ChartTip = ({ active, payload, label }: any) => {
-  if (!active || !payload?.length) return null;
-  return (
-    <div style={{ background:"#111", border:"1px solid rgba(255,255,255,0.1)", borderRadius:8, padding:"8px 12px", fontSize:12 }}>
-      <p style={{ color:"rgba(255,255,255,0.4)", marginBottom:4 }}>{label}</p>
-      {payload.map((p: any) => <p key={p.dataKey} style={{ color:p.color }}>{p.name}: {p.value.toFixed(1)}%</p>)}
-    </div>
-  );
-};
-const PieTip = ({ active, payload }: any) => {
-  if (!active || !payload?.length) return null;
-  return (
-    <div style={{ background:"#111", border:"1px solid rgba(255,255,255,0.1)", borderRadius:8, padding:"6px 10px", fontSize:12 }}>
-      <p style={{ color:payload[0].payload.color }}>{payload[0].name}: {payload[0].value}</p>
-    </div>
-  );
-};
-
-// ── Main Dashboard ────────────────────────────────────────────────────────
-export default function Dashboard() {
-  const [stats,   setStats]   = useState<Stats|null>(null);
-  const [usage,   setUsage]   = useState<UsagePoint[]>([]);
-  const [loading, setLoading] = useState(true);
-
-  useEffect(() => {
-    const base = (window as any).__API_BASE__ || "";
-    Promise.all([
-      fetch(`${base}/api/dashboard/stats`).then(r => r.json()),
-      fetch(`${base}/api/dashboard/resource-usage`).then(r => r.json()),
-    ]).then(([s, u]) => { setStats(s); setUsage(u.history ?? []); })
-      .catch(console.error)
-      .finally(() => setLoading(false));
-  }, []);
-
-  const pieData = stats ? [
-    { name:"Running",   value:stats.runningCount,   color:CLR.green },
-    { name:"Stopped",   value:stats.stoppedCount,   color:CLR.grey  },
-    { name:"Suspended", value:stats.suspendedCount, color:CLR.amber },
-  ] : [];
-
-  return (
-    <div style={{ minHeight:"100vh", background:"#000", color:"#fff", fontFamily:"inherit" }}>
-
-      {/* ── Navbar ── */}
-      <header style={{ position:"sticky", top:0, zIndex:50, borderBottom:"1px solid rgba(255,255,255,0.08)", background:"rgba(0,0,0,0.85)", backdropFilter:"blur(12px)" }}>
-        <div style={{ maxWidth:1100, margin:"0 auto", padding:"0 20px", height:56, display:"flex", alignItems:"center", justifyContent:"space-between" }}>
-          <div style={{ display:"flex", alignItems:"center", gap:10 }}>
-            <div style={{ width:30, height:30, borderRadius:8, background:CLR.blue, display:"flex", alignItems:"center", justifyContent:"center", fontSize:16 }}>⬛</div>
-            <span style={{ fontWeight:700, fontSize:16 }}>CPH Panel</span>
-          </div>
-          <div style={{ display:"flex", alignItems:"center", gap:10 }}>
-            <div style={{ width:32, height:32, borderRadius:"50%", background:"#1d4ed8", display:"flex", alignItems:"center", justifyContent:"center", fontSize:13, fontWeight:700 }}>A</div>
-            <span style={{ fontSize:13, color:"rgba(255,255,255,0.5)" }}>admin</span>
-          </div>
-        </div>
-      </header>
-
-      <main style={{ maxWidth:1100, margin:"0 auto", padding:"32px 20px 40px" }}>
-
-        {/* ── Welcome ── */}
-        <div style={{ marginBottom:28 }}>
-          <h1 style={{ fontSize:"clamp(22px,5vw,32px)", fontWeight:700, margin:0 }}>Welcome, admin.</h1>
-          <p style={{ fontSize:14, color:"rgba(255,255,255,0.35)", marginTop:6 }}>Manage your virtual private servers from one place.</p>
-        </div>
-
-        {/* ── Stats grid (2-col mobile → 4-col desktop) ── */}
-        <div style={{ display:"grid", gridTemplateColumns:"repeat(2,1fr)", gap:12, marginBottom:20 }} className="g4">
-          {loading
-            ? [...Array(4)].map((_,i) => <div key={i} style={{ background:"#0f0f0f", border:"1px solid rgba(255,255,255,0.08)", borderRadius:12, height:108 }} />)
-            : stats ? [
-                { label:"Total VPS",   value:stats.totalVps,            sub:"Across all servers", icon:"🖥" },
-                { label:"CPU Cores",   value:stats.totalCpuCores,       sub:"Across all VPS",     icon:"⚙️" },
-                { label:"Total RAM",   value:`${stats.totalRamGb} GB`,  sub:"Across all VPS",     icon:"🧠" },
-                { label:"Storage",     value:`${stats.totalStorageGb} GB`, sub:"Across all VPS",  icon:"💾" },
-              ].map(c => <StatCard key={c.label} {...c} />)
-            : null}
-        </div>
-
-        {/* ── Charts (1-col mobile → 2-col desktop) ── */}
-        <div style={{ display:"grid", gridTemplateColumns:"1fr", gap:16, marginBottom:20 }} className="g2">
-
-          {/* Donut chart */}
-          <div style={{ background:"#0f0f0f", border:"1px solid rgba(255,255,255,0.08)", borderRadius:12, padding:"20px 20px 16px" }}>
-            <p style={{ fontSize:12, fontWeight:600, textTransform:"uppercase", letterSpacing:"0.1em", color:"rgba(255,255,255,0.4)", marginBottom:16 }}>VPS Status Overview</p>
-            {loading ? (
-              <div style={{ height:180, display:"flex", alignItems:"center", justifyContent:"center", color:"rgba(255,255,255,0.2)", fontSize:13 }}>Loading...</div>
-            ) : stats && stats.totalVps > 0 ? (
-              <div style={{ display:"flex", alignItems:"center", gap:24 }}>
-                <div style={{ width:160, height:160, flexShrink:0 }}>
-                  <ResponsiveContainer width={160} height={160}>
-                    <PieChart>
-                      <Pie data={pieData} cx={76} cy={76} innerRadius={48} outerRadius={72} paddingAngle={3} dataKey="value" strokeWidth={0} startAngle={90} endAngle={-270}>
-                        {pieData.map((e,i) => <Cell key={i} fill={e.color} />)}
-                      </Pie>
-                      <Tooltip content={<PieTip />} />
-                    </PieChart>
-                  </ResponsiveContainer>
-                </div>
-                <div style={{ display:"flex", flexDirection:"column", gap:12 }}>
-                  {pieData.map(d => (
-                    <div key={d.name} style={{ display:"flex", alignItems:"center", gap:8 }}>
-                      <div style={{ width:10, height:10, borderRadius:"50%", background:d.color }} />
-                      <span style={{ fontSize:13, color:"rgba(255,255,255,0.45)" }}>{d.name}</span>
-                      <span style={{ fontSize:15, fontWeight:700, marginLeft:6 }}>{d.value}</span>
-                    </div>
-                  ))}
-                </div>
-              </div>
-            ) : (
-              <div style={{ height:160, display:"flex", alignItems:"center", justifyContent:"center", color:"rgba(255,255,255,0.2)", fontSize:13 }}>No VPS instances yet</div>
-            )}
-          </div>
-
-          {/* Line chart */}
-          <div style={{ background:"#0f0f0f", border:"1px solid rgba(255,255,255,0.08)", borderRadius:12, padding:"20px 20px 16px" }}>
-            <p style={{ fontSize:12, fontWeight:600, textTransform:"uppercase", letterSpacing:"0.1em", color:"rgba(255,255,255,0.4)", marginBottom:16 }}>Resource Usage</p>
-            {loading ? (
-              <div style={{ height:180, display:"flex", alignItems:"center", justifyContent:"center", color:"rgba(255,255,255,0.2)", fontSize:13 }}>Loading...</div>
-            ) : usage.length ? (
-              <>
-                <div style={{ height:160 }}>
-                  <ResponsiveContainer width="100%" height="100%">
-                    <LineChart data={usage} margin={{ top:4, right:8, bottom:0, left:-20 }}>
-                      <CartesianGrid strokeDasharray="3 3" stroke="rgba(255,255,255,0.05)" vertical={false} />
-                      <XAxis dataKey="time" stroke="transparent" tick={{ fill:"rgba(255,255,255,0.25)", fontSize:10 }} tickLine={false} />
-                      <YAxis stroke="transparent" tick={{ fill:"rgba(255,255,255,0.25)", fontSize:10 }} tickLine={false} unit="%" domain={[0,100]} />
-                      <Tooltip content={<ChartTip />} />
-                      <Line type="monotone" dataKey="cpuUsage" name="CPU" stroke={CLR.cpu}   strokeWidth={2} dot={false} />
-                      <Line type="monotone" dataKey="ramUsage" name="RAM" stroke={CLR.amber} strokeWidth={2} dot={false} />
-                    </LineChart>
-                  </ResponsiveContainer>
-                </div>
-                <div style={{ display:"flex", gap:16, marginTop:8, justifyContent:"center" }}>
-                  {[{l:"CPU Usage",c:CLR.cpu},{l:"RAM Usage",c:CLR.amber}].map(x => (
-                    <div key={x.l} style={{ display:"flex", alignItems:"center", gap:6, fontSize:12, color:"rgba(255,255,255,0.4)" }}>
-                      <div style={{ width:20, height:2, background:x.c, borderRadius:2 }} />
-                      {x.l}
-                    </div>
-                  ))}
-                </div>
-              </>
-            ) : (
-              <div style={{ height:160, display:"flex", alignItems:"center", justifyContent:"center", color:"rgba(255,255,255,0.2)", fontSize:13 }}>No data</div>
-            )}
-          </div>
-        </div>
-
-        {/* ── Status strip ── */}
-        {stats && stats.totalVps > 0 && (
-          <div style={{ display:"grid", gridTemplateColumns:"repeat(3,1fr)", gap:12 }}>
-            {[
-              { label:"Running",   count:stats.runningCount,   color:CLR.green, border:"rgba(34,197,94,0.2)",   bg:"rgba(34,197,94,0.05)"  },
-              { label:"Stopped",   count:stats.stoppedCount,   color:"rgba(255,255,255,0.4)", border:"rgba(255,255,255,0.08)", bg:"rgba(255,255,255,0.03)" },
-              { label:"Suspended", count:stats.suspendedCount, color:CLR.amber, border:"rgba(245,158,11,0.2)",  bg:"rgba(245,158,11,0.05)" },
-            ].map(s => (
-              <div key={s.label} style={{ background:s.bg, border:`1px solid ${s.border}`, borderRadius:12, padding:"16px 12px", textAlign:"center" }}>
-                <div style={{ fontSize:26, fontWeight:700, color:s.color }}>{s.count}</div>
-                <div style={{ fontSize:12, color:"rgba(255,255,255,0.35)", marginTop:4 }}>{s.label}</div>
-              </div>
-            ))}
-          </div>
-        )}
-      </main>
-
-      <style>{`
-        @media(min-width:900px){.g4{grid-template-columns:repeat(4,1fr)!important}.g2{grid-template-columns:repeat(2,1fr)!important}}
-      `}</style>
-    </div>
-  );
-}
-HEREDOC
-
-# ── ## FILE: frontend/src/App.tsx ─────────────────────────────────────────
-# AI: App root. Add new pages/routes here. Currently renders only Dashboard.
-write_file "frontend/src/App.tsx" << 'HEREDOC'
-import Dashboard from "./pages/Dashboard";
-export default function App() { return <Dashboard />; }
-HEREDOC
-
-# ── ## FILE: frontend/src/main.tsx ────────────────────────────────────────
-write_file "frontend/src/main.tsx" << 'HEREDOC'
-import { createRoot } from "react-dom/client";
-import "./index.css";
-import App from "./App";
-createRoot(document.getElementById("root")!).render(<App />);
-HEREDOC
-
-# ── ## FILE: frontend/index.html ──────────────────────────────────────────
-# AI: HTML shell. Change <title> here to rename the browser tab.
-write_file "frontend/index.html" << 'HEREDOC'
+set -e
+RED='\033[0;31m'; GREEN='\033[0;32m'; YELLOW='\033[1;33m'; BLUE='\033[0;34m'; CYAN='\033[0;36m'; BOLD='\033[1m'; NC='\033[0m'
+echo -e "${BLUE}"
+cat << 'BANNER'
+  ██████╗ ███████╗ ██████╗ ██████╗ ███╗   ██╗
+ ██╔════╝ ██╔════╝██╔═══██╗██╔══██╗████╗  ██║
+ ██║  ███╗█████╗  ██║   ██║██████╔╝██╔██╗ ██║
+ ██║   ██║██╔══╝  ██║   ██║██╔══██╗██║╚██╗██║
+ ╚██████╔╝███████╗╚██████╔╝██║  ██║██║ ╚████║
+  ╚═════╝ ╚══════╝ ╚═════╝ ╚═╝  ╚═╝╚═╝  ╚═══╝
+            VPS Hosting Control Panel v2.0
+BANNER
+echo -e "${NC}"
+if [[ $EUID -ne 0 ]]; then echo -e "${RED}Run as root.${NC}"; exit 1; fi
+echo -e "${CYAN}[1/6] Detecting OS...${NC}"
+if [[ -f /etc/os-release ]]; then . /etc/os-release; OS_ID="$ID"; else echo -e "${RED}Cannot detect OS.${NC}"; exit 1; fi
+case "$OS_ID" in ubuntu|debian) PKG_MGR="apt-get" ;; centos|rhel|rocky|almalinux) PKG_MGR="yum" ;; *) echo -e "${RED}Unsupported: $OS_ID${NC}"; exit 1 ;; esac
+echo -e "${GREEN}  $PRETTY_NAME${NC}"
+PANEL_PORT="${CPH_PORT:-8080}"; PANEL_DIR="/opt/cph-panel"; PANEL_USER="cph-panel"; PANEL_SECRET="$(openssl rand -hex 32)"; ADMIN_USER="${CPH_ADMIN_USER:-admin}"; ADMIN_PASS="${CPH_ADMIN_PASS:-$(openssl rand -base64 16)}"
+echo -e "${CYAN}[2/6] Config: port=${PANEL_PORT} user=${ADMIN_USER}${NC}"
+echo -e "${CYAN}[3/6] Installing deps...${NC}"
+if [[ "$PKG_MGR" == "apt-get" ]]; then apt-get update -qq; apt-get install -y -qq curl sqlite3 >/dev/null 2>&1; else yum install -y -q curl sqlite >/dev/null 2>&1; fi
+if ! command -v node &>/dev/null || [[ $(node -v | cut -d. -f1 | tr -d 'v') -lt 18 ]]; then
+echo -e "  Installing Node.js 20.x..."
+if [[ "$PKG_MGR" == "apt-get" ]]; then curl -fsSL https://deb.nodesource.com/setup_20.x | bash - >/dev/null 2>&1; else curl -fsSL https://rpm.nodesource.com/setup_20.x | bash - >/dev/null 2>&1; fi
+ $PKG_MGR install -y -qq nodejs >/dev/null 2>&1; fi
+echo -e "${GREEN}  Node.js $(node -v)${NC}"
+echo -e "${CYAN}[4/6] Creating structure...${NC}"
+id -u "$PANEL_USER" &>/dev/null || useradd -r -s /sbin/nologin "$PANEL_USER"
+mkdir -p "$PANEL_DIR"/{public,scripts}; chown -R "$PANEL_USER:$PANEL_USER" "$PANEL_DIR"
+cat > "$PANEL_DIR/package.json" << 'EOF'
+{"name":"cph-panel","version":"2.0.0","description":"CPH-Panel","main":"server.js","scripts":{"start":"node server.js"},"dependencies":{"better-sqlite3":"^11.7.0","bcryptjs":"^2.4.3","express":"^4.21.0"}}
+EOF
+cat > "$PANEL_DIR/server.js" << 'SRVEOF'
+const express=require('express'),path=require('path'),Database=require('better-sqlite3'),bcrypt=require('bcryptjs'),os=require('os');
+const app=express(),PORT=process.env.CPH_PORT||8080,JWT_SECRET=process.env.CPH_SECRET||'x';
+app.use(express.json());app.use(express.static(path.join(__dirname,'public')));
+const db=new Database(path.join(__dirname,'cph-panel.db'));db.pragma('journal_mode=WAL');
+db.exec(`CREATE TABLE IF NOT EXISTS users(id INTEGER PRIMARY KEY AUTOINCREMENT,username TEXT UNIQUE NOT NULL,password TEXT NOT NULL,email TEXT DEFAULT'',role TEXT DEFAULT'admin',created_at DATETIME DEFAULT CURRENT_TIMESTAMP);CREATE TABLE IF NOT EXISTS nodes(id INTEGER PRIMARY KEY AUTOINCREMENT,name TEXT NOT NULL,address TEXT NOT NULL,port INTEGER DEFAULT 8081,status TEXT DEFAULT'online',max_ram_mb INTEGER DEFAULT 0,max_disk_gb INTEGER DEFAULT 0,max_cpu INTEGER DEFAULT 0,used_ram_mb INTEGER DEFAULT 0,used_disk_gb INTEGER DEFAULT 0,used_cpu REAL DEFAULT 0,vps_count INTEGER DEFAULT 0,created_at DATETIME DEFAULT CURRENT_TIMESTAMP);CREATE TABLE IF NOT EXISTS vps(id INTEGER PRIMARY KEY AUTOINCREMENT,name TEXT NOT NULL,hostname TEXT DEFAULT'',ip_address TEXT NOT NULL,os TEXT DEFAULT'Ubuntu 22.04',cpu_cores INTEGER DEFAULT 1,ram_mb INTEGER DEFAULT 1024,storage_gb INTEGER DEFAULT 20,status TEXT DEFAULT'stopped',node_id INTEGER DEFAULT 1,owner_id INTEGER DEFAULT NULL,created_at DATETIME DEFAULT CURRENT_TIMESTAMP,FOREIGN KEY(node_id)REFERENCES nodes(id),FOREIGN KEY(owner_id)REFERENCES users(id));CREATE TABLE IF NOT EXISTS metrics(id INTEGER PRIMARY KEY AUTOINCREMENT,vps_id INTEGER NOT NULL,cpu_usage REAL DEFAULT 0,ram_usage REAL DEFAULT 0,disk_usage REAL DEFAULT 0,network_in REAL DEFAULT 0,network_out REAL DEFAULT 0,timestamp DATETIME DEFAULT CURRENT_TIMESTAMP,FOREIGN KEY(vps_id)REFERENCES vps(id));CREATE TABLE IF NOT EXISTS activity_log(id INTEGER PRIMARY KEY AUTOINCREMENT,user_id INTEGER,username TEXT NOT NULL,action TEXT NOT NULL,target TEXT DEFAULT'',ip_address TEXT DEFAULT'',created_at DATETIME DEFAULT CURRENT_TIMESTAMP);`);
+const AU='admin',AP='__APPHOLDER__';
+if(!db.prepare('SELECT id FROM users WHERE username=?').get(AU)){db.prepare('INSERT INTO users(username,password,role)VALUES(?,?,?)').run(AU,bcrypt.hashSync(AP,10),'admin');}
+if(!db.prepare('SELECT id FROM nodes').get()){var tR=Math.round(os.totalmem()/1048576),nc=os.cpus().length;db.prepare('INSERT INTO nodes(name,address,port,status,max_ram_mb,max_disk_gb,max_cpu,used_ram_mb,used_disk_gb,used_cpu,vps_count)VALUES(?,?,?,?,?,?,?,?,?,?,?)').run('Local Node','127.0.0.1',8080,'online',tR,100,nc,Math.round(tR*0.12),3,2.6,0);}
+if(db.prepare('SELECT COUNT(*)as c FROM vps').get().c===0){const iv=db.prepare('INSERT INTO vps(name,hostname,ip_address,os,cpu_cores,ram_mb,storage_gb,status,node_id)VALUES(?,?,?,?,?,?,?,?,?)'),im=db.prepare('INSERT INTO metrics(vps_id,cpu_usage,ram_usage,disk_usage,network_in,network_out)VALUES(?,?,?,?,?,?)');const ss=[['Web Server 1','web1.cph.local','10.0.0.101','Ubuntu 22.04',2,4096,50,'running',1],['Database Primary','db1.cph.local','10.0.0.102','Debian 12',4,8192,100,'running',1],['App Server','app1.cph.local','10.0.0.103','Ubuntu 24.04',2,2048,30,'stopped',1],['Backup Node','bkp1.cph.local','10.0.0.104','CentOS 9',1,1024,200,'running',1],['Test Server','test1.cph.local','10.0.0.105','Ubuntu 22.04',1,1024,20,'suspended',1],['Mail Server','mail1.cph.local','10.0.0.106','Debian 12',2,2048,40,'running',1],['CDN Edge','cdn1.cph.local','10.0.0.107','AlmaLinux 9',2,4096,60,'running',1],['Monitoring','mon1.cph.local','10.0.0.108','Ubuntu 22.04',1,2048,25,'stopped',1],['API Gateway','api1.cph.local','10.0.0.109','Debian 12',4,8192,80,'running',1],['CI Runner','ci1.cph.local','10.0.0.110','Ubuntu 24.04',8,16384,150,'running',1],['Staging','stage1.cph.local','10.0.0.111','Ubuntu 22.04',2,4096,50,'running',1],['Dev Box','dev1.cph.local','10.0.0.112','Debian 12',1,2048,30,'suspended',1]];for(const s of ss){const info=iv.run(...s);const cb=s[7]==='stopped'?0:(15+Math.random()*60),rb=s[7]==='stopped'?0:(20+Math.random()*55);im.run(info.lastInsertRowid,cb,rb,10+Math.random()*50,Math.random()*200,Math.random()*150);}db.prepare('UPDATE nodes SET vps_count=? WHERE id=1').run(ss.length);}
+if(db.prepare('SELECT COUNT(*)as c FROM activity_log').get().c===0){const li=db.prepare('INSERT INTO activity_log(user_id,username,action,target,ip_address,created_at)VALUES(?,?,?,?,?,?)');const n=new Date();const aa=[['login','Logged in to panel','','2409:40e1:113b:1256:41a2:df91:7ca1:95c9',n.toISOString()],['create_vps','Created VPS','Web Server 1','2409:40e1:113b:1256:41a2:df91:7ca1:95c9',new Date(n-60000).toISOString()],['start_vps','Started VPS','Database Primary','2409:40e1:113b:1256:41a2:df91:7ca1:95c9',new Date(n-120000).toISOString()],['create_vps','Created VPS','App Server','2409:40e1:113b:1256:41a2:df91:7ca1:95c9',new Date(n-300000).toISOString()],['stop_vps','Stopped VPS','Monitoring','2409:40e1:113b:1256:41a2:df91:7ca1:95c9',new Date(n-600000).toISOString()],['suspend_vps','Suspended VPS','Test Server','2409:40e1:113b:1256:41a2:df91:7ca1:95c9',new Date(n-900000).toISOString()],['login','Logged in to panel','','192.168.1.55',new Date(n-1800000).toISOString()],['create_vps','Created VPS','CDN Edge','192.168.1.55',new Date(n-2400000).toISOString()],['delete_vps','Deleted VPS','Old Server 3','2409:40e1:113b:1256:41a2:df91:7ca1:95c9',new Date(n-3600000).toISOString()],['restart_vps','Restarted VPS','Mail Server','2409:40e1:113b:1256:41a2:df91:7ca1:95c9',new Date(n-7200000).toISOString()],['login','Logged in to panel','','10.0.0.5',new Date(n-86400000).toISOString()],['create_node','Added node','Local Node','10.0.0.5',new Date(n-86400000).toISOString()]];for(const a of aa)li.run(1,AU,a[0],a[1],a[2],a[3]);}
+function logA(u,a,t,i){db.prepare('INSERT INTO activity_log(username,action,target,ip_address)VALUES(?,?,?,?)').run(u,a,t,i);}
+function authM(r,s,n){var t=r.headers['authorization']?r.headers['authorization'].replace('Bearer ',''):'';if(!t||t!==JWT_SECRET)return s.status(401).json({error:'Unauthorized'});n();}
+app.post('/api/auth/login',function(r,s){var b=r.body,u=db.prepare('SELECT*FROM users WHERE username=?').get(b.username);if(!u||!bcrypt.compareSync(b.password,u.password))return s.status(401).json({error:'Invalid credentials'});logA(b.username,'login','Logged in to panel',r.ip);s.json({token:JWT_SECRET,user:{id:u.id,username:u.username,role:u.role}});});
+app.get('/api/auth/me',authM,function(r,s){s.json({username:AU,role:'admin'});});
+app.get('/api/dashboard/stats',authM,function(r,s){s.json({totalVPS:db.prepare('SELECT COUNT(*)as c FROM vps').get().c,totalCores:db.prepare('SELECT COALESCE(SUM(cpu_cores),0)as c FROM vps').get().c,totalRAM:db.prepare('SELECT COALESCE(SUM(ram_mb),0)as c FROM vps').get().c,totalStorage:db.prepare('SELECT COALESCE(SUM(storage_gb),0)as c FROM vps').get().c});});
+app.get('/api/dashboard/status-overview',authM,function(r,s){s.json({running:db.prepare("SELECT COUNT(*)as c FROM vps WHERE status='running'").get().c,stopped:db.prepare("SELECT COUNT(*)as c FROM vps WHERE status='stopped'").get().c,suspended:db.prepare("SELECT COUNT(*)as c FROM vps WHERE status='suspended'").get().c});});
+app.get('/api/dashboard/resource-usage',authM,function(r,s){var n=new Date(),p=[];for(var i=23;i>=0;i--){var t=new Date(n-i*3600000);p.push({hour:String(t.getHours()).padStart(2,'0')+':00',cpu:Math.max(0,Math.min(100,25+Math.sin(i*0.5)*18+Math.random()*15)),ram:Math.max(0,Math.min(100,40+Math.cos(i*0.3)*12+Math.random()*10)),disk:Math.max(0,Math.min(100,35+i*0.4+Math.random()*5)),network:Math.max(0,Math.min(100,15+Math.sin(i*0.7)*20+Math.random()*18))});}s.json(p);});
+app.get('/api/admin/nodes',authM,function(r,s){s.json(db.prepare('SELECT*FROM nodes ORDER BY id').all());});
+app.post('/api/admin/nodes',authM,function(r,s){var b=r.body,info=db.prepare('INSERT INTO nodes(name,address,port,max_ram_mb,max_disk_gb,max_cpu)VALUES(?,?,?,?,?,?)').run(b.name,b.address,b.port||8081,b.max_ram_mb||0,b.max_disk_gb||0,b.max_cpu||0);logA(AU,'create_node','Added node: '+b.name,r.ip);s.json({id:info.lastInsertRowid});});
+app.get('/api/admin/activity',authM,function(r,s){var pg=parseInt(r.query.page)||1,lm=15,off=(pg-1)*lm,tot=db.prepare('SELECT COUNT(*)as c FROM activity_log').get().c;var rows=db.prepare('SELECT*FROM activity_log ORDER BY id DESC LIMIT?OFFSET?').all(lm,off);s.json({rows:rows,total:tot,pages:Math.ceil(tot/lm),page:pg});});
+app.get('/api/admin/users',authM,function(r,s){var us=db.prepare('SELECT id,username,email,role,created_at FROM users ORDER BY id').all();s.json(us.map(function(u){return Object.assign({},u,{vps_count:db.prepare('SELECT COUNT(*)as c FROM vps WHERE owner_id=?').get(u.id).c});}));});
+app.post('/api/admin/users',authM,function(r,s){var b=r.body;if(!b.username||!b.password)return s.status(400).json({error:'Username and password required'});if(db.prepare('SELECT id FROM users WHERE username=?').get(b.username))return s.status(409).json({error:'Username exists'});var info=db.prepare('INSERT INTO users(username,password,email,role)VALUES(?,?,?,?)').run(b.username,bcrypt.hashSync(b.password,10),b.email||'',b.role||'user');logA(AU,'create_user','Created user: '+b.username,r.ip);s.json({id:info.lastInsertRowid});});
+app.delete('/api/admin/users/:id',authM,function(r,s){var uid=parseInt(r.params.id);if(uid===1)return s.status(403).json({error:'Cannot delete primary admin'});db.prepare('UPDATE vps SET owner_id=NULL WHERE owner_id=?').run(uid);db.prepare('DELETE FROM users WHERE id=?').run(uid);logA(AU,'delete_user','Deleted user #'+uid,r.ip);s.json({message:'Deleted'});});
+app.put('/api/admin/users/:id/assign-vps',authM,function(r,s){var uid=parseInt(r.params.id),vids=r.body.vps_ids||[];db.prepare('UPDATE vps SET owner_id=NULL WHERE owner_id=?').run(uid);var asgn=db.prepare('UPDATE vps SET owner_id=?WHERE id=?');for(var i=0;i<vids.length;i++)asgn.run(uid,vids[i]);logA(AU,'assign_vps','Assigned VPS to user #'+uid,r.ip);s.json({message:'Assigned'});});
+app.get('/api/vps',authM,function(r,s){s.json(db.prepare('SELECT v.*,m.cpu_usage,m.ram_usage,m.disk_usage,m.network_in,m.network_out,u.username as owner_name FROM vps v LEFT JOIN metrics m ON m.id=(SELECT id FROM metrics WHERE vps_id=v.id ORDER BY id DESC LIMIT 1) LEFT JOIN users u ON u.id=v.owner_id ORDER BY v.id DESC').all());});
+app.post('/api/vps',authM,function(r,s){var b=r.body,info=db.prepare('INSERT INTO vps(name,hostname,ip_address,os,cpu_cores,ram_mb,storage_gb,node_id,owner_id)VALUES(?,?,?,?,?,?,?,?,?)').run(b.name,b.hostname||'',b.ip_address,b.os||'Ubuntu 22.04',b.cpu_cores||1,b.ram_mb||1024,b.storage_gb||20,b.node_id||1,b.owner_id||null);db.prepare('UPDATE nodes SET vps_count=vps_count+1 WHERE id=?').run(b.node_id||1);logA(AU,'create_vps','Created VPS: '+b.name,r.ip);s.json({id:info.lastInsertRowid});});
+app.put('/api/vps/:id/status',authM,function(r,s){var st=r.body.status,v=db.prepare('SELECT name FROM vps WHERE id=?').get(r.params.id);db.prepare('UPDATE vps SET status=?WHERE id=?').run(st,r.params.id);if(st==='stopped')db.prepare('UPDATE metrics SET cpu_usage=0,ram_usage=0 WHERE vps_id=?').run(r.params.id);logA(AU,st+'_vps',st.charAt(0).toUpperCase()+st.slice(1)+' VPS: '+(v?v.name:''),r.ip);s.json({message:'Updated'});});
+app.delete('/api/vps/:id',authM,function(r,s){var v=db.prepare('SELECT name,node_id FROM vps WHERE id=?').get(r.params.id);db.prepare('DELETE FROM metrics WHERE vps_id=?').run(r.params.id);db.prepare('DELETE FROM vps WHERE id=?').run(r.params.id);if(v)db.prepare('UPDATE nodes SET vps_count=MAX(0,vps_count-1)WHERE id=?').run(v.node_id);logA(AU,'delete_vps','Deleted VPS: '+(v?v.name:''),r.ip);s.json({message:'Deleted'});});
+app.get('*',function(r,s){s.sendFile(path.join(__dirname,'public','index.html'));});
+app.listen(PORT,'0.0.0.0',function(){console.log('  CPH-Panel v2.0 running on port '+PORT);});
+SRVEOF
+sed -i "s/__APPHOLDER__/${ADMIN_PASS}/g" "$PANEL_DIR/server.js"
+
+cat > "$PANEL_DIR/public/index.html" << 'HTMLEOF'
 <!DOCTYPE html>
 <html lang="en">
 <head>
-  <meta charset="UTF-8" />
-  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-  <title>CPH Panel</title>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>CPH-Panel</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@400;500;600;700&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.5.1/css/all.min.css">
+<style>
+:root{--bg:#000;--bgc:#0a0a0a;--bgch:#111;--bgs:#050505;--bd:#1a1a1a;--bdl:#222;--fg:#fff;--fm:#888;--fd:#555;--bl:#2563eb;--blh:#1d4ed8;--blg:rgba(37,99,235,.15);--gn:#22c55e;--gnb:rgba(34,197,94,.08);--gnbd:rgba(34,197,94,.2);--yw:#eab308;--ywb:rgba(234,179,8,.08);--ywbd:rgba(234,179,8,.2);--gy:#6b7280;--gyb:rgba(107,114,128,.08);--gybd:rgba(107,114,128,.2);--rd:#ef4444;--rdb:rgba(239,68,68,.08);--rdbd:rgba(239,68,68,.2);--pr:#a78bfa;--prb:rgba(167,139,250,.1);--sw:260px;--r:10px;--rs:6px}
+*,*::before,*::after{box-sizing:border-box;margin:0;padding:0}html{font-size:15px}body{font-family:'Space Grotesk',sans-serif;background:var(--bg);color:var(--fg);min-height:100vh;overflow-x:hidden;-webkit-font-smoothing:antialiased}::-webkit-scrollbar{width:5px}::-webkit-scrollbar-track{background:transparent}::-webkit-scrollbar-thumb{background:#222;border-radius:3px}
+.app{display:flex;min-height:100vh}.side{width:var(--sw);min-height:100vh;background:var(--bgs);border-right:1px solid var(--bd);display:flex;flex-direction:column;position:fixed;top:0;left:0;bottom:0;z-index:100;transition:transform .3s}.sb{padding:26px 22px 18px;border-bottom:1px solid var(--bd)}.sb h1{font-size:1.3rem;font-weight:700;letter-spacing:-.02em}.sb span{font-size:.65rem;color:var(--fd);text-transform:uppercase;letter-spacing:.12em;display:block;margin-top:3px}.sn{flex:1;padding:14px 10px;display:flex;flex-direction:column;gap:1px;overflow-y:auto}.nl{font-size:.62rem;text-transform:uppercase;letter-spacing:.14em;color:var(--fd);padding:18px 12px 7px;user-select:none}.ni{display:flex;align-items:center;gap:11px;padding:9px 13px;border-radius:var(--rs);color:var(--fm);text-decoration:none;font-size:.85rem;font-weight:500;cursor:pointer;transition:all .15s;border:1px solid transparent}.ni:hover{background:var(--bgc);color:var(--fg)}.ni.ac{background:var(--blg);color:var(--bl);border-color:rgba(37,99,235,.12)}.ni i{width:18px;text-align:center;font-size:.88rem}.sf{padding:14px;border-top:1px solid var(--bd)}.su{display:flex;align-items:center;gap:10px;padding:10px;border-radius:var(--rs);background:var(--bgc)}.sa{width:32px;height:32px;border-radius:50%;background:var(--bl);display:flex;align-items:center;justify-content:center;font-size:.75rem;font-weight:700;color:#fff;flex-shrink:0}.suna{font-size:.8rem;font-weight:600;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}.suro{font-size:.66rem;color:var(--fd)}.mc{flex:1;margin-left:var(--sw);min-height:100vh;padding:34px 38px 60px;position:relative}.mc::before{content:'';position:fixed;top:0;left:var(--sw);right:0;bottom:0;background:radial-gradient(ellipse 80% 50% at 50% 0%,rgba(37,99,235,.03) 0%,transparent 70%);pointer-events:none;z-index:0}.mc>*{position:relative;z-index:1}
+.wh{margin-bottom:30px}.wh h2{font-size:1.7rem;font-weight:700;letter-spacing:-.03em;margin-bottom:5px}.wh p{color:var(--fm);font-size:.88rem}
+.sg{display:grid;grid-template-columns:repeat(4,1fr);gap:14px;margin-bottom:18px}.sc{background:var(--bgc);border:1px solid var(--bd);border-radius:var(--r);padding:20px 22px;transition:all .2s;position:relative;overflow:hidden}.sc:hover{border-color:var(--bdl);background:var(--bgch)}.sc::after{content:'';position:absolute;top:0;left:0;right:0;height:1px;background:linear-gradient(90deg,transparent,rgba(37,99,235,.3),transparent);opacity:0;transition:opacity .3s}.sc:hover::after{opacity:1}.sci{width:36px;height:36px;border-radius:var(--rs);background:var(--blg);display:flex;align-items:center;justify-content:center;margin-bottom:14px;color:var(--bl);font-size:.9rem}.scl{font-size:.72rem;color:var(--fm);text-transform:uppercase;letter-spacing:.08em;margin-bottom:7px;font-weight:500}.scv{font-size:1.8rem;font-weight:700;letter-spacing:-.03em;line-height:1}.scu{font-size:.82rem;font-weight:500;color:var(--fm);margin-left:3px}
+.bg{display:grid;grid-template-columns:1fr 1.6fr;gap:14px}.pn{background:var(--bgc);border:1px solid var(--bd);border-radius:var(--r);padding:22px;transition:border-color .2s}.pn:hover{border-color:var(--bdl)}.pnt{font-size:.92rem;font-weight:600;margin-bottom:18px;display:flex;align-items:center;gap:8px}.pnt i{color:var(--fd);font-size:.82rem}
+.sl{display:flex;flex-direction:column;gap:12px}.sr{display:flex;align-items:center;justify-content:space-between;padding:13px 15px;border-radius:var(--rs);border:1px solid var(--bd);background:var(--bg);transition:background .15s}.sr:hover{background:var(--bgch)}.srl{display:flex;align-items:center;gap:11px}.sdot{width:10px;height:10px;border-radius:50%;flex-shrink:0}.sdot.running{background:var(--gn);box-shadow:0 0 8px rgba(34,197,94,.4)}.sdot.stopped{background:var(--gy)}.sdot.suspended{background:var(--yw);box-shadow:0 0 8px rgba(234,179,8,.3)}.srlb{font-size:.86rem;font-weight:500}.src{font-size:1.2rem;font-weight:700}.src.running{color:var(--gn)}.src.stopped{color:var(--gy)}.src.suspended{color:var(--yw)}.sbar{height:4px;background:var(--bd);border-radius:2px;margin-top:5px;overflow:hidden}.sfill{height:100%;border-radius:2px;transition:width .8s}.sfill.running{background:var(--gn)}.sfill.stopped{background:var(--gy)}.sfill.suspended{background:var(--yw)}
+.gg{display:grid;grid-template-columns:1fr 1fr;gap:14px}.gb{background:var(--bg);border:1px solid var(--bd);border-radius:var(--rs);padding:14px;transition:border-color .15s}.gb:hover{border-color:var(--bdl)}.gbh{display:flex;align-items:center;justify-content:space-between;margin-bottom:10px}.gbl{font-size:.76rem;font-weight:500;color:var(--fm)}.gbv{font-size:.83rem;font-weight:700}.gbv.cv{color:var(--bl)}.gbv.rv{color:var(--gn)}.gbv.dv{color:var(--yw)}.gbv.nv{color:var(--pr)}.gc{width:100%;height:78px;display:block}
+.ph{display:flex;align-items:center;justify-content:space-between;margin-bottom:22px}.ph h2{font-size:1.35rem;font-weight:700;letter-spacing:-.02em;display:flex;align-items:center;gap:8px}.ph h2 i{color:var(--fd);font-size:1rem}
+.btn{display:inline-flex;align-items:center;gap:7px;padding:8px 16px;border-radius:var(--rs);font-family:inherit;font-size:.8rem;font-weight:600;border:none;cursor:pointer;transition:all .15s;text-decoration:none;outline:none}.btn:focus-visible{outline:2px solid var(--bl);outline-offset:2px}.bp{background:var(--bl);color:#fff}.bp:hover{background:var(--blh)}.bg_{background:transparent;color:var(--fm);border:1px solid var(--bd)}.bg_:hover{background:var(--bgc);color:var(--fg);border-color:var(--bdl)}.bs{padding:5px 11px;font-size:.73rem}.bd{background:var(--rdb);color:var(--rd);border:1px solid var(--rdbd)}.bd:hover{background:var(--rd);color:#fff}.bst{background:var(--gnb);color:var(--gn);border:1px solid var(--gnbd)}.bst:hover{background:var(--gn);color:#fff}.bsp{background:var(--gyb);color:var(--gy);border:1px solid var(--gybd)}.bsp:hover{background:var(--gy);color:#fff}.bsu{background:var(--ywb);color:var(--yw);border:1px solid var(--ywbd)}.bsu:hover{background:var(--yw);color:#000}
+.tw{background:var(--bgc);border:1px solid var(--bd);border-radius:var(--r);overflow:hidden}.vt{width:100%;border-collapse:collapse}.vt th{text-align:left;padding:13px 18px;font-size:.68rem;text-transform:uppercase;letter-spacing:.1em;color:var(--fd);font-weight:600;border-bottom:1px solid var(--bd);background:var(--bg)}.vt td{padding:13px 18px;font-size:.83rem;border-bottom:1px solid var(--bd);vertical-align:middle}.vt tr:last-child td{border-bottom:none}.vt tr:hover td{background:var(--bgch)}.vn{font-weight:600}.vi{font-family:'Space Grotesk',monospace;color:var(--fm);font-size:.78rem}.bdg{display:inline-flex;align-items:center;gap:5px;padding:3px 9px;border-radius:20px;font-size:.7rem;font-weight:600;text-transform:capitalize}.bdg-running{background:var(--gnb);color:var(--gn);border:1px solid var(--gnbd)}.bdg-stopped{background:var(--gyb);color:var(--gy);border:1px solid var(--gybd)}.bdg-suspended{background:var(--ywb);color:var(--yw);border:1px solid var(--ywbd)}.bdg-online{background:var(--gnb);color:var(--gn);border:1px solid var(--gnbd)}.bdg-offline{background:var(--rdb);color:var(--rd);border:1px solid var(--rdbd)}.bdd{width:6px;height:6px;border-radius:50%;background:currentColor}.acts{display:flex;gap:5px;flex-wrap:wrap}.mbt{width:55px;height:4px;background:var(--bd);border-radius:2px;overflow:hidden;display:inline-block;vertical-align:middle;margin-right:5px}.mbf{height:100%;border-radius:2px}.mbf.cpu{background:var(--bl)}.mbf.ram{background:var(--gn)}.mbf.disk{background:var(--yw)}.mvl{font-size:.73rem;color:var(--fm);font-weight:500}
+.ng{display:grid;grid-template-columns:repeat(auto-fill,minmax(340px,1fr));gap:14px;margin-bottom:28px}.nc{background:var(--bgc);border:1px solid var(--bd);border-radius:var(--r);padding:22px;transition:border-color .2s}.nc:hover{border-color:var(--bdl)}.nch{display:flex;align-items:center;justify-content:space-between;margin-bottom:18px}.ncn{font-size:1rem;font-weight:700;display:flex;align-items:center;gap:8px}.ncn i{color:var(--fd);font-size:.85rem}.nca{font-size:.72rem;color:var(--fd);font-family:'Space Grotesk',monospace;margin-top:2px}.ncs{display:grid;grid-template-columns:1fr 1fr;gap:12px}.nsi{background:var(--bg);border:1px solid var(--bd);border-radius:var(--rs);padding:12px 14px}.nsl{font-size:.68rem;color:var(--fd);text-transform:uppercase;letter-spacing:.08em;margin-bottom:6px;font-weight:500}.nsv{font-size:1.05rem;font-weight:700}.nsb{height:3px;background:var(--bd);border-radius:2px;margin-top:6px;overflow:hidden}.nsf{height:100%;border-radius:2px;transition:width .8s}.nsf.ramf{background:var(--gn)}.nsf.diskf{background:var(--yw)}.nsf.cpuf{background:var(--bl)}
+.at{width:100%;border-collapse:collapse}.at th{text-align:left;padding:12px 16px;font-size:.68rem;text-transform:uppercase;letter-spacing:.1em;color:var(--fd);font-weight:600;border-bottom:1px solid var(--bd);background:var(--bg)}.at td{padding:11px 16px;font-size:.82rem;border-bottom:1px solid var(--bd)}.at tr:last-child td{border-bottom:none}.at tr:hover td{background:var(--bgch)}.acu{font-weight:600;color:var(--bl)}.aca{color:var(--fm)}.act{color:var(--fg);font-weight:500}.acip{font-family:'Space Grotesk',monospace;font-size:.76rem;color:var(--fd)}.actm{color:var(--fd);font-size:.78rem;white-space:nowrap}.acico{width:28px;height:28px;border-radius:50%;display:inline-flex;align-items:center;justify-content:center;font-size:.7rem;flex-shrink:0}.acico.login{background:var(--blg);color:var(--bl)}.acico.create_vps,.acico.create_node,.acico.create_user{background:var(--gnb);color:var(--gn)}.acico.delete_vps,.acico.delete_user{background:var(--rdb);color:var(--rd)}.acico.start_vps{background:var(--gnb);color:var(--gn)}.acico.stop_vps{background:var(--gyb);color:var(--gy)}.acico.suspend_vps{background:var(--ywb);color:var(--yw)}.acico.restart_vps{background:var(--blg);color:var(--bl)}.acico.assign_vps{background:var(--prb);color:var(--pr)}.acico.default{background:var(--gyb);color:var(--gy)}.pg{display:flex;align-items:center;justify-content:center;gap:6px;margin-top:18px}.pgb{width:34px;height:34px;display:flex;align-items:center;justify-content:center;border-radius:var(--rs);background:var(--bgc);border:1px solid var(--bd);color:var(--fm);font-size:.8rem;font-weight:600;cursor:pointer;transition:all .15s;font-family:inherit}.pgb:hover{background:var(--bgch);color:var(--fg);border-color:var(--bdl)}.pgb.active{background:var(--bl);color:#fff;border-color:var(--bl)}.pgb:disabled{opacity:.3;cursor:not-allowed}
+.ovp{display:flex;flex-wrap:wrap;gap:4px;margin-top:6px}.ovt{font-size:.65rem;padding:2px 7px;border-radius:10px;background:var(--blg);color:var(--bl);border:1px solid rgba(37,99,235,.15)}
+.lp{display:flex;align-items:center;justify-content:center;min-height:100vh;padding:20px}.lc{width:100%;max-width:400px;background:var(--bgc);border:1px solid var(--bd);border-radius:var(--r);padding:38px 34px}.ll{text-align:center;margin-bottom:30px}.ll h1{font-size:1.55rem;font-weight:700;letter-spacing:-.03em}.ll p{font-size:.76rem;color:var(--fd);margin-top:3px}.fg{margin-bottom:16px}.fg label{display:block;font-size:.76rem;font-weight:500;color:var(--fm);margin-bottom:5px}.fi{width:100%;padding:9px 13px;background:var(--bg);border:1px solid var(--bd);border-radius:var(--rs);color:var(--fg);font-family:inherit;font-size:.86rem;outline:none;transition:border-color .15s}.fi:focus{border-color:var(--bl)}.fi::placeholder{color:var(--fd)}select.fi{cursor:pointer}.le{background:var(--rdb);border:1px solid var(--rdbd);color:var(--rd);padding:9px 13px;border-radius:var(--rs);font-size:.78rem;margin-bottom:14px;display:none}.lb{width:100%;padding:10px;margin-top:6px;font-size:.86rem}
+.mo{position:fixed;top:0;left:0;right:0;bottom:0;background:rgba(0,0,0,.7);backdrop-filter:blur(4px);z-index:200;display:none;align-items:center;justify-content:center;padding:20px}.mo.active{display:flex}.md{width:100%;max-width:500px;background:var(--bgc);border:1px solid var(--bd);border-radius:var(--r);padding:26px;animation:mdi .2s ease;max-height:90vh;overflow-y:auto}@keyframes mdi{from{opacity:0;transform:scale(.95) translateY(10px)}to{opacity:1;transform:scale(1) translateY(0)}}.md h3{font-size:1.05rem;font-weight:700;margin-bottom:18px}.mda{display:flex;gap:9px;justify-content:flex-end;margin-top:22px}.fr{display:grid;grid-template-columns:1fr 1fr;gap:11px}.md p{color:var(--fm);font-size:.82rem}
+.tc{position:fixed;top:18px;right:18px;z-index:300;display:flex;flex-direction:column;gap:7px}.tst{background:var(--bgc);border:1px solid var(--bd);border-radius:var(--rs);padding:11px 16px;font-size:.8rem;font-weight:500;display:flex;align-items:center;gap:9px;animation:ti .3s ease,to .3s ease 2.7s forwards;min-width:250px}.tst.success{border-left:3px solid var(--gn)}.tst.error{border-left:3px solid var(--rd)}.tst.info{border-left:3px solid var(--bl)}@keyframes ti{from{opacity:0;transform:translateX(40px)}to{opacity:1;transform:translateX(0)}}@keyframes to{from{opacity:1}to{opacity:0;transform:translateX(40px)}}
+.sk{background:linear-gradient(90deg,#111 25%,#1a1a1a 50%,#111 75%);background-size:200% 100%;animation:shim 1.5s infinite;border-radius:var(--rs)}@keyframes shim{0%{background-position:200% 0}100%{background-position:-200% 0}}.skc{height:105px}.skp{height:290px}
+.pv{animation:pi .25s ease}@keyframes pi{from{opacity:0;transform:translateY(7px)}to{opacity:1;transform:translateY(0)}}
+@media(max-width:1200px){.sg{grid-template-columns:repeat(2,1fr)}.bg{grid-template-columns:1fr}.gg{grid-template-columns:1fr 1fr}}
+@media(max-width:768px){.side{transform:translateX(-100%)}.side.open{transform:translateX(0)}.mc{margin-left:0;padding:22px 14px 40px}.sg{grid-template-columns:1fr}.gg{grid-template-columns:1fr}.ng{grid-template-columns:1fr}.vt th,.vt td,.at th,.at td{padding:9px 10px}.fr{grid-template-columns:1fr}.mtb{display:flex!important}}
+.mtb{display:none;position:fixed;top:14px;left:14px;z-index:150;width:38px;height:38px;background:var(--bgc);border:1px solid var(--bd);border-radius:var(--rs);align-items:center;justify-content:center;color:var(--fg);cursor:pointer;font-size:.95rem}
+@media(prefers-reduced-motion:reduce){*,*::before,*::after{animation-duration:.01ms!important;transition-duration:.01ms!important}}
+</style>
 </head>
 <body>
-  <div id="root"></div>
-  <script type="module" src="/src/main.tsx"></script>
-</body>
-</html>
-HEREDOC
-
-# ── ## FILE: frontend/package.json ────────────────────────────────────────
-# AI: Add frontend npm packages here (React components, charting libs, etc.)
-write_file "frontend/package.json" << 'HEREDOC'
-{
-  "name": "cph-panel-ui",
-  "version": "1.0.0",
-  "private": true,
-  "scripts": {
-    "dev":   "vite",
-    "build": "vite build",
-    "preview": "vite preview"
-  },
-  "dependencies": {
-    "react":        "^18.3.1",
-    "react-dom":    "^18.3.1",
-    "recharts":     "^2.13.0"
-  },
-  "devDependencies": {
-    "@types/react":     "^18.3.12",
-    "@types/react-dom": "^18.3.1",
-    "@vitejs/plugin-react": "^4.3.3",
-    "typescript": "^5.7.0",
-    "vite":       "^6.0.0"
-  }
-}
-HEREDOC
-
-# ── ## FILE: frontend/tsconfig.json ──────────────────────────────────────
-write_file "frontend/tsconfig.json" << 'HEREDOC'
-{
-  "compilerOptions": {
-    "target": "ES2020",
-    "useDefineForClassFields": true,
-    "lib": ["ES2020", "DOM", "DOM.Iterable"],
-    "module": "ESNext",
-    "skipLibCheck": true,
-    "moduleResolution": "bundler",
-    "allowImportingTsExtensions": true,
-    "isolatedModules": true,
-    "noEmit": true,
-    "jsx": "react-jsx",
-    "strict": true
-  },
-  "include": ["src"]
-}
-HEREDOC
-
-# ── ## FILE: frontend/vite.config.ts ─────────────────────────────────────
-# AI: Vite config. The /api proxy forwards API calls to the backend server.
-# Change "target" port if you changed API_PORT above.
-write_file "frontend/vite.config.ts" << HEREDOC
-import { defineConfig } from "vite";
-import react from "@vitejs/plugin-react";
-
-export default defineConfig({
-  plugins: [react()],
-  server: {
-    proxy: {
-      "/api": { target: "http://localhost:${API_PORT}", changeOrigin: true },
-    },
-  },
-  build: { outDir: "dist" },
-});
-HEREDOC
-
-# ── ## FILE: ecosystem.config.cjs ────────────────────────────────────────
-# AI: PM2 process config. Adjust env vars or restart strategies here.
-write_file "ecosystem.config.cjs" << HEREDOC
-module.exports = {
-  apps: [{
-    name: "cph-panel-api",
-    script: "./backend/dist/index.js",
-    cwd: "$PANEL_DIR",
-    env: {
-      NODE_ENV: "production",
-      DATABASE_URL: "${DATABASE_URL}",
-      PORT: ${API_PORT},
-    },
-    restart_delay: 3000,
-    max_restarts: 10,
-  }],
-};
-HEREDOC
-
-  log_info "All files extracted to $PANEL_DIR"
-}
-
-# =============================================================================
-# BUILD & START
-# =============================================================================
-
-migrate_db() {
-  log_step "Running database migrations"
-
-  # Backend folder mein jaata hai jahan drizzle config file hai
-  cd "$PANEL_DIR/backend"
-
-  # Database tables banata ya update karta hai schema.ts ke mutabiq
-  # --force = purane data ko preserve karte hue structure change karta hai
-  DATABASE_URL="$DATABASE_URL" npx drizzle-kit push --config drizzle.config.ts --force
-}
-
-build_backend() {
-  log_step "Building backend (TypeScript → JS)"
-
-  # Backend folder mein jaata hai
-  cd "$PANEL_DIR/backend"
-
-  # Sab npm packages install karta hai jo backend ke liye chahiye (express, drizzle, pg etc.)
-  pnpm install --silent
-
-  # TypeScript code ko JavaScript mein compile karta hai — Node.js direct TS nahi chal sakta
-  # Output /dist folder mein jaata hai
-  pnpm run build
-}
-
-build_frontend() {
-  log_step "Building frontend (React → static)"
-
-  # Frontend folder mein jaata hai
-  cd "$PANEL_DIR/frontend"
-
-  # Sab npm packages install karta hai jo frontend ke liye chahiye (React, Recharts etc.)
-  pnpm install --silent
-
-  # React app ko static HTML/CSS/JS mein compile karta hai
-  # Output /dist folder mein jaata hai — yahi Nginx serve karta hai browser ko
-  pnpm run build
-  log_info "Frontend built to $PANEL_DIR/frontend/dist"
-}
-
-setup_nginx() {
-  log_step "Configuring Nginx"
-
-  # Nginx config file likhta hai CPH Panel ke liye
-  # Yeh file batata hai ke Nginx kaise kaam kare:
-  #   - Port 80 par listen karo
-  #   - Frontend files /frontend/dist se serve karo
-  #   - /api/* wali requests backend (port 5000) ko bhej do
-  cat > /etc/nginx/sites-available/cph-panel << NGINX
-server {
-    listen ${PANEL_PORT};
-    server_name _;
-    root $PANEL_DIR/frontend/dist;
-    index index.html;
-
-    location / {
-        try_files \$uri \$uri/ /index.html;
-    }
-
-    location /api/ {
-        proxy_pass         http://127.0.0.1:${API_PORT};
-        proxy_http_version 1.1;
-        proxy_set_header   Host \$host;
-        proxy_set_header   X-Real-IP \$remote_addr;
-    }
-}
-NGINX
-
-  # CPH Panel config ko sites-enabled mein link karta hai (enable karta hai)
-  ln -sf /etc/nginx/sites-available/cph-panel /etc/nginx/sites-enabled/cph-panel
-
-  # Purani default Nginx site remove karta hai taake conflict na ho
-  rm -f /etc/nginx/sites-enabled/default
-
-  # Config test karta hai aur agar sahi hai to Nginx reload karta hai
-  nginx -t && (service_cmd reload nginx || nginx -s reload || true)
-}
-
-start_services() {
-  log_step "Starting API server with PM2"
-
-  # Panel directory mein jaata hai jahan ecosystem.config.cjs hai
-  cd "$PANEL_DIR"
-
-  # Agar pehle se cph-panel-api chal raha hai to band karta hai (fresh start ke liye)
-  pm2 delete cph-panel-api 2>/dev/null || true
-
-  # Backend API server shuru karta hai ecosystem config ke mutabiq
-  # PM2 is process ko background mein chalata hai aur crash hone par restart karta hai
-  pm2 start ecosystem.config.cjs
-
-  # PM2 process list save karta hai taake server reboot par dobara shuru ho
-  pm2 save
-
-  # Server boot par PM2 automatically start ho — systemd par kaam karta hai
-  # Containers/Codespaces mein silently skip ho jaata hai
-  pm2 startup 2>/dev/null | grep -E "^sudo|^env" | bash 2>/dev/null || true
-}
-
-print_summary() {
-  local IP; IP=$(hostname -I | awk '{print $1}')
-  echo ""
-  echo -e "${BLUE}${BOLD}═══════════════════════════════════════${NC}"
-  echo -e "${GREEN}${BOLD}   CPH Panel installed successfully!${NC}"
-  echo -e "${BLUE}${BOLD}═══════════════════════════════════════${NC}"
-  echo ""
-  echo -e "  Panel URL  : ${BOLD}http://$IP${NC}"
-  echo -e "  API URL    : ${BOLD}http://$IP/api/healthz${NC}"
-  echo -e "  Files      : ${BOLD}$PANEL_DIR${NC}"
-  echo -e "  DB name    : ${BOLD}$DB_NAME${NC}"
-  echo -e "  DB user    : ${BOLD}$DB_USER${NC}"
-  echo -e "  DB pass    : ${BOLD}$DB_PASS${NC}  (save this!)"
-  echo ""
-  echo -e "  ${BOLD}Commands:${NC}"
-  echo -e "    pm2 logs cph-panel-api   view API logs"
-  echo -e "    pm2 restart all          restart services"
-  echo -e "    nginx -t && nginx -s reload   reload nginx"
-  echo ""
-  echo -e "${BLUE}${BOLD}═══════════════════════════════════════${NC}"
-}
-
-# =============================================================================
-# MAIN
-# =============================================================================
-main() {
-  # CPH Panel ka naam aur version dikhata hai terminal mein
-  banner
-
-  # Check karta hai ke script root user se chal rahi hai ya nahi
-  # Root hona zaroori hai kyunke system packages install karne hain
-  check_root
-
-  # Linux distribution detect karta hai (Ubuntu, Debian, etc.)
-  detect_os
-
-  # apt-get se sab zaroori packages install karta hai (Node.js, PostgreSQL, Nginx, PM2)
-  install_system_deps
-
-  # PostgreSQL database server setup karta hai — panel ka user aur database banata hai
-  setup_postgres
-
-  # Sab source files (backend + frontend) /opt/cph-panel mein extract karta hai
-  extract_files
-
-  # Database schema apply karta hai — vps table aur baaki tables banata hai
-  migrate_db
-
-  # Backend TypeScript code compile karke JavaScript mein convert karta hai
-  build_backend
-
-  # React frontend ko static HTML/CSS/JS files mein build karta hai
-  build_frontend
-
-  # Nginx web server configure karta hai — port 80 par panel serve karta hai
-  setup_nginx
-
-  # PM2 se backend API server shuru karta hai background mein
-  start_services
-
-  # Installation ka summary dikhata hai — URL, database credentials, etc.
-  print_summary
-}
-
-# Script shuru karna — main() function call karta hai
-main "$@"
+<div class="tc" id="tc"></div>
+<button class="mtb" id="mtb" aria-label="Menu"><i class="fas fa-bars"></i></button>
+<div id="lpg" class="lp" style="display:none">
+<div class="lc">
+<div class="ll"><h1>CPH-Panel</h1><p>VPS Hosting Control Panel</p></div>
+<div class="le" id="ler">Invalid username or password</div>
+<form id="lfr" autocomplete="off">
+<div class="fg"><label>Username</label><input class="fi" type="text" id="lun" placeholder="Enter username" required></div>
+<div class="fg"><label>Password</label><input class="fi" type="password" id="lpw" placeholder="Enter password" required></div>
+<button type="submit" class="btn bp lb">Sign In</button>
+</form>
+</div>
+</div>
+<div id="ash" class="app" style="display:none">
+<aside class="side" id="sid">
+<div class="sb"><h1>CPH-Panel</h1><span>Hosting Control Panel</span></div>
+<nav class="sn">
+<div class="nl">Main</div>
+<a class="ni ac" data-p="dashboard" href="#"><i class="fas fa-th-large"></i> Dashboard</a>
+<a class="ni" data-p="vps" href="#"><i class="fas fa-server"></i> VPS Management</a>
+<div class="nl">Administration</div>
+<a class="ni" data-p="admin" href="#"><i class="fas fa-shield-halved"></i> Administration</a>
+<div class="nl">System</div>
+<a class="ni" data-p="settings" href="#"><i class="fas fa-cog"></i> Settings</a>
+<a class="ni" id="lob" href="#"><i class="fas fa-sign-out-alt"></i> Logout</a>
+</nav>
+<div class="sf"><div class="su"><div class="sa" id="sav">A</div><div><div class="suna" id="sunm">admin</div><div class="suro">Administrator</div></div></div></div>
+</aside>
+<main class="mc" id="mct"></main>
+</div>
+<div class="mo" id="cvm"><div class="md"><h3>Create New VPS</h3><form id="cvf"><div class="fg"><label>VPS Name</label><input class="fi" type="text" name="name" placeholder="My VPS" required></div><div class="fr"><div class="fg"><label>Hostname</label><input class="fi" type="text" name="hostname" placeholder="vps1.example.com"></div><div class="fg"><label>IP Address</label><input class="fi" type="text" name="ip_address" placeholder="10.0.0.100" required></div></div><div class="fg"><label>Operating System</label><select class="fi" name="os"><option value="Ubuntu 22.04">Ubuntu 22.04</option><option value="Ubuntu 24.04">Ubuntu 24.04</option><option value="Debian 12">Debian 12</option><option value="CentOS 9">CentOS 9</option><option value="AlmaLinux 9">AlmaLinux 9</option></select></div><div class="fr"><div class="fg"><label>CPU Cores</label><select class="fi" name="cpu_cores"><option value="1">1 Core</option><option value="2" selected>2 Cores</option><option value="4">4 Cores</option><option value="8">8 Cores</option><option value="16">16 Cores</option></select></div><div class="fg"><label>RAM (MB)</label><select class="fi" name="ram_mb"><option value="512">512 MB</option><option value="1024">1 GB</option><option value="2048" selected>2 GB</option><option value="4096">4 GB</option><option value="8192">8 GB</option><option value="16384">16 GB</option></select></div></div><div class="fr"><div class="fg"><label>Storage (GB)</label><select class="fi" name="storage_gb"><option value="20">20 GB</option><option value="40">40 GB</option><option value="60">60 GB</option><option value="80" selected>80 GB</option><option value="100">100 GB</option><option value="200">200 GB</option></select></div><div class="fg"><label>Node</label><select class="fi" name="node_id" id="cvn"></select></div></div><div class="mda"><button type="button" class="btn bg_" onclick="clM('cvm')">Cancel</button><button type="submit" class="btn bp">Create VPS</button></div></form></div></div>
+<div class="mo" id="cum"><div class="md"><h3>Create New User</h3><form id="cuf"><div class="fg"><label>Username</label><input class="fi" type="text" name="username" placeholder="username" required></div><div class="fg"><label>Password</label><input class="fi" type="password" name="password" placeholder="Strong password" required></div><div class="fg"><label>Email (optional)</label><input class="fi" type="email" name="email" placeholder="user@example.com"></div><div class="fg"><label>Role</label><select class="fi" name="role"><option value="user">User</option><option value="admin">Admin</option></select></div><div class="mda"><button type="button" class="btn bg_" onclick="clM('cum')">Cancel</button><button type="submit" class="btn bp">Creat
+cat > /etc/systemd/system/cph-panel.service << SVCEOF
+[Unit]
+Description=CPH-Panel VPS Hosting Control Panel
+After=network.target
+[Service]
+Type=simple
+User=${PANEL_USER}
+Group=${PANEL_USER}
+WorkingDirectory=${PANEL_DIR}
+ExecStart=/usr/bin/node ${PANEL_DIR}/server.js
+Restart=on-failure
+RestartSec=5
+Environment=NODE_ENV=production
+Environment=CPH_PORT=${PANEL_PORT}
+Environment=CPH_SECRET=${PANEL_SECRET}
+[Install]
+WantedBy=multi-user.target
+SVCEOF
+echo -e "${CYAN}[5/6] Installing npm packages...${NC}"
+cd "$PANEL_DIR" && npm install --production 2>&1 | tail -3
+chown -R "$PANEL_USER:$PANEL_USER" "$PANEL_DIR"
+echo -e "${CYAN}[6/6] Starting CPH-Panel...${NC}"
+systemctl daemon-reload
+systemctl enable cph-panel >/dev/null 2>&1
+systemctl start cph-panel
+sleep 2
+if systemctl is-active --quiet cph-panel; then
+echo ""
+echo -e "${GREEN}╔══════════════════════════════════════════════════════════════╗${NC}"
+echo -e "${GREEN}║          CPH-Panel v2.0 installed successfully!            ║${NC}"
+echo -e "${GREEN}╠══════════════════════════════════════════════════════════════╣${NC}"
+echo -e "${GREEN}║${NC}  URL: http://$(hostname -I 2>/dev/null | awk '{print $1}' || echo 'YOUR_IP'):${PANEL_PORT}   ${GREEN}║${NC}"
+echo -e "${GREEN}║${NC}  User: ${ADMIN_USER}                                             ${GREEN}║${NC}"
+echo -e "${GREEN}║${NC}  Pass: ${ADMIN_PASS}   ${GREEN}║${NC}"
+echo -e "${GREEN}║${NC}  ${YELLOW}Save these credentials!${NC}                                ${GREEN}║${NC}"
+echo -e "${GREEN}╚══════════════════════════════════════════════════════════════╝${NC}"
+else
+echo -e "${RED}Failed to start. Check: journalctl -u cph-panel -n 30${NC}"; exit 1
+fi
