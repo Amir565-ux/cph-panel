@@ -10,7 +10,7 @@ SERVICE_NAME="cph-panel"
 API_PORT=3001
 WEB_PORT=3000
 NODE_VERSION="20"
-REPO_URL="https://github.com/YOUR_USER/YOUR_REPO"
+REPO_URL="https://github.com/Amir565-ux/cph-panel"
 BRANCH="main"
 
 BLUE='\033[0;34m'; GREEN='\033[0;32m'; RED='\033[0;31m'; YELLOW='\033[1;33m'; NC='\033[0m'
