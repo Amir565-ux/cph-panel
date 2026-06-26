@@ -1,176 +1,624 @@
 #!/bin/bash
-set -e
-RED='\033[0;31m'; GREEN='\033[0;32m'; YELLOW='\033[1;33m'; BLUE='\033[0;34m'; CYAN='\033[0;36m'; BOLD='\033[1m'; NC='\033[0m'
-echo -e "${BLUE}"
-cat << 'BANNER'
-  ██████╗ ███████╗ ██████╗ ██████╗ ███╗   ██╗
- ██╔════╝ ██╔════╝██╔═══██╗██╔══██╗████╗  ██║
- ██║  ███╗█████╗  ██║   ██║██████╔╝██╔██╗ ██║
- ██║   ██║██╔══╝  ██║   ██║██╔══██╗██║╚██╗██║
- ╚██████╔╝███████╗╚██████╔╝██║  ██║██║ ╚████║
-  ╚═════╝ ╚══════╝ ╚═════╝ ╚═╝  ╚═╝╚═╝  ╚═══╝
-            VPS Hosting Control Panel v2.0
-BANNER
-echo -e "${NC}"
-if [[ $EUID -ne 0 ]]; then echo -e "${RED}Run as root.${NC}"; exit 1; fi
-echo -e "${CYAN}[1/6] Detecting OS...${NC}"
-if [[ -f /etc/os-release ]]; then . /etc/os-release; OS_ID="$ID"; else echo -e "${RED}Cannot detect OS.${NC}"; exit 1; fi
-case "$OS_ID" in ubuntu|debian) PKG_MGR="apt-get" ;; centos|rhel|rocky|almalinux) PKG_MGR="yum" ;; *) echo -e "${RED}Unsupported: $OS_ID${NC}"; exit 1 ;; esac
-echo -e "${GREEN}  $PRETTY_NAME${NC}"
-PANEL_PORT="${CPH_PORT:-8080}"; PANEL_DIR="/opt/cph-panel"; PANEL_USER="cph-panel"; PANEL_SECRET="$(openssl rand -hex 32)"; ADMIN_USER="${CPH_ADMIN_USER:-admin}"; ADMIN_PASS="${CPH_ADMIN_PASS:-$(openssl rand -base64 16)}"
-echo -e "${CYAN}[2/6] Config: port=${PANEL_PORT} user=${ADMIN_USER}${NC}"
-echo -e "${CYAN}[3/6] Installing deps...${NC}"
-if [[ "$PKG_MGR" == "apt-get" ]]; then apt-get update -qq; apt-get install -y -qq curl sqlite3 >/dev/null 2>&1; else yum install -y -q curl sqlite >/dev/null 2>&1; fi
-if ! command -v node &>/dev/null || [[ $(node -v | cut -d. -f1 | tr -d 'v') -lt 18 ]]; then
-echo -e "  Installing Node.js 20.x..."
-if [[ "$PKG_MGR" == "apt-get" ]]; then curl -fsSL https://deb.nodesource.com/setup_20.x | bash - >/dev/null 2>&1; else curl -fsSL https://rpm.nodesource.com/setup_20.x | bash - >/dev/null 2>&1; fi
- $PKG_MGR install -y -qq nodejs >/dev/null 2>&1; fi
-echo -e "${GREEN}  Node.js $(node -v)${NC}"
-echo -e "${CYAN}[4/6] Creating structure...${NC}"
-id -u "$PANEL_USER" &>/dev/null || useradd -r -s /sbin/nologin "$PANEL_USER"
-mkdir -p "$PANEL_DIR"/{public,scripts}; chown -R "$PANEL_USER:$PANEL_USER" "$PANEL_DIR"
-cat > "$PANEL_DIR/package.json" << 'EOF'
-{"name":"cph-panel","version":"2.0.0","description":"CPH-Panel","main":"server.js","scripts":{"start":"node server.js"},"dependencies":{"better-sqlite3":"^11.7.0","bcryptjs":"^2.4.3","express":"^4.21.0"}}
-EOF
-cat > "$PANEL_DIR/server.js" << 'SRVEOF'
-const express=require('express'),path=require('path'),Database=require('better-sqlite3'),bcrypt=require('bcryptjs'),os=require('os');
-const app=express(),PORT=process.env.CPH_PORT||8080,JWT_SECRET=process.env.CPH_SECRET||'x';
-app.use(express.json());app.use(express.static(path.join(__dirname,'public')));
-const db=new Database(path.join(__dirname,'cph-panel.db'));db.pragma('journal_mode=WAL');
-db.exec(`CREATE TABLE IF NOT EXISTS users(id INTEGER PRIMARY KEY AUTOINCREMENT,username TEXT UNIQUE NOT NULL,password TEXT NOT NULL,email TEXT DEFAULT'',role TEXT DEFAULT'admin',created_at DATETIME DEFAULT CURRENT_TIMESTAMP);CREATE TABLE IF NOT EXISTS nodes(id INTEGER PRIMARY KEY AUTOINCREMENT,name TEXT NOT NULL,address TEXT NOT NULL,port INTEGER DEFAULT 8081,status TEXT DEFAULT'online',max_ram_mb INTEGER DEFAULT 0,max_disk_gb INTEGER DEFAULT 0,max_cpu INTEGER DEFAULT 0,used_ram_mb INTEGER DEFAULT 0,used_disk_gb INTEGER DEFAULT 0,used_cpu REAL DEFAULT 0,vps_count INTEGER DEFAULT 0,created_at DATETIME DEFAULT CURRENT_TIMESTAMP);CREATE TABLE IF NOT EXISTS vps(id INTEGER PRIMARY KEY AUTOINCREMENT,name TEXT NOT NULL,hostname TEXT DEFAULT'',ip_address TEXT NOT NULL,os TEXT DEFAULT'Ubuntu 22.04',cpu_cores INTEGER DEFAULT 1,ram_mb INTEGER DEFAULT 1024,storage_gb INTEGER DEFAULT 20,status TEXT DEFAULT'stopped',node_id INTEGER DEFAULT 1,owner_id INTEGER DEFAULT NULL,created_at DATETIME DEFAULT CURRENT_TIMESTAMP,FOREIGN KEY(node_id)REFERENCES nodes(id),FOREIGN KEY(owner_id)REFERENCES users(id));CREATE TABLE IF NOT EXISTS metrics(id INTEGER PRIMARY KEY AUTOINCREMENT,vps_id INTEGER NOT NULL,cpu_usage REAL DEFAULT 0,ram_usage REAL DEFAULT 0,disk_usage REAL DEFAULT 0,network_in REAL DEFAULT 0,network_out REAL DEFAULT 0,timestamp DATETIME DEFAULT CURRENT_TIMESTAMP,FOREIGN KEY(vps_id)REFERENCES vps(id));CREATE TABLE IF NOT EXISTS activity_log(id INTEGER PRIMARY KEY AUTOINCREMENT,user_id INTEGER,username TEXT NOT NULL,action TEXT NOT NULL,target TEXT DEFAULT'',ip_address TEXT DEFAULT'',created_at DATETIME DEFAULT CURRENT_TIMESTAMP);`);
-const AU='admin',AP='__APPHOLDER__';
-if(!db.prepare('SELECT id FROM users WHERE username=?').get(AU)){db.prepare('INSERT INTO users(username,password,role)VALUES(?,?,?)').run(AU,bcrypt.hashSync(AP,10),'admin');}
-if(!db.prepare('SELECT id FROM nodes').get()){var tR=Math.round(os.totalmem()/1048576),nc=os.cpus().length;db.prepare('INSERT INTO nodes(name,address,port,status,max_ram_mb,max_disk_gb,max_cpu,used_ram_mb,used_disk_gb,used_cpu,vps_count)VALUES(?,?,?,?,?,?,?,?,?,?,?)').run('Local Node','127.0.0.1',8080,'online',tR,100,nc,Math.round(tR*0.12),3,2.6,0);}
-if(db.prepare('SELECT COUNT(*)as c FROM vps').get().c===0){const iv=db.prepare('INSERT INTO vps(name,hostname,ip_address,os,cpu_cores,ram_mb,storage_gb,status,node_id)VALUES(?,?,?,?,?,?,?,?,?)'),im=db.prepare('INSERT INTO metrics(vps_id,cpu_usage,ram_usage,disk_usage,network_in,network_out)VALUES(?,?,?,?,?,?)');const ss=[['Web Server 1','web1.cph.local','10.0.0.101','Ubuntu 22.04',2,4096,50,'running',1],['Database Primary','db1.cph.local','10.0.0.102','Debian 12',4,8192,100,'running',1],['App Server','app1.cph.local','10.0.0.103','Ubuntu 24.04',2,2048,30,'stopped',1],['Backup Node','bkp1.cph.local','10.0.0.104','CentOS 9',1,1024,200,'running',1],['Test Server','test1.cph.local','10.0.0.105','Ubuntu 22.04',1,1024,20,'suspended',1],['Mail Server','mail1.cph.local','10.0.0.106','Debian 12',2,2048,40,'running',1],['CDN Edge','cdn1.cph.local','10.0.0.107','AlmaLinux 9',2,4096,60,'running',1],['Monitoring','mon1.cph.local','10.0.0.108','Ubuntu 22.04',1,2048,25,'stopped',1],['API Gateway','api1.cph.local','10.0.0.109','Debian 12',4,8192,80,'running',1],['CI Runner','ci1.cph.local','10.0.0.110','Ubuntu 24.04',8,16384,150,'running',1],['Staging','stage1.cph.local','10.0.0.111','Ubuntu 22.04',2,4096,50,'running',1],['Dev Box','dev1.cph.local','10.0.0.112','Debian 12',1,2048,30,'suspended',1]];for(const s of ss){const info=iv.run(...s);const cb=s[7]==='stopped'?0:(15+Math.random()*60),rb=s[7]==='stopped'?0:(20+Math.random()*55);im.run(info.lastInsertRowid,cb,rb,10+Math.random()*50,Math.random()*200,Math.random()*150);}db.prepare('UPDATE nodes SET vps_count=? WHERE id=1').run(ss.length);}
-if(db.prepare('SELECT COUNT(*)as c FROM activity_log').get().c===0){const li=db.prepare('INSERT INTO activity_log(user_id,username,action,target,ip_address,created_at)VALUES(?,?,?,?,?,?)');const n=new Date();const aa=[['login','Logged in to panel','','2409:40e1:113b:1256:41a2:df91:7ca1:95c9',n.toISOString()],['create_vps','Created VPS','Web Server 1','2409:40e1:113b:1256:41a2:df91:7ca1:95c9',new Date(n-60000).toISOString()],['start_vps','Started VPS','Database Primary','2409:40e1:113b:1256:41a2:df91:7ca1:95c9',new Date(n-120000).toISOString()],['create_vps','Created VPS','App Server','2409:40e1:113b:1256:41a2:df91:7ca1:95c9',new Date(n-300000).toISOString()],['stop_vps','Stopped VPS','Monitoring','2409:40e1:113b:1256:41a2:df91:7ca1:95c9',new Date(n-600000).toISOString()],['suspend_vps','Suspended VPS','Test Server','2409:40e1:113b:1256:41a2:df91:7ca1:95c9',new Date(n-900000).toISOString()],['login','Logged in to panel','','192.168.1.55',new Date(n-1800000).toISOString()],['create_vps','Created VPS','CDN Edge','192.168.1.55',new Date(n-2400000).toISOString()],['delete_vps','Deleted VPS','Old Server 3','2409:40e1:113b:1256:41a2:df91:7ca1:95c9',new Date(n-3600000).toISOString()],['restart_vps','Restarted VPS','Mail Server','2409:40e1:113b:1256:41a2:df91:7ca1:95c9',new Date(n-7200000).toISOString()],['login','Logged in to panel','','10.0.0.5',new Date(n-86400000).toISOString()],['create_node','Added node','Local Node','10.0.0.5',new Date(n-86400000).toISOString()]];for(const a of aa)li.run(1,AU,a[0],a[1],a[2],a[3]);}
-function logA(u,a,t,i){db.prepare('INSERT INTO activity_log(username,action,target,ip_address)VALUES(?,?,?,?)').run(u,a,t,i);}
-function authM(r,s,n){var t=r.headers['authorization']?r.headers['authorization'].replace('Bearer ',''):'';if(!t||t!==JWT_SECRET)return s.status(401).json({error:'Unauthorized'});n();}
-app.post('/api/auth/login',function(r,s){var b=r.body,u=db.prepare('SELECT*FROM users WHERE username=?').get(b.username);if(!u||!bcrypt.compareSync(b.password,u.password))return s.status(401).json({error:'Invalid credentials'});logA(b.username,'login','Logged in to panel',r.ip);s.json({token:JWT_SECRET,user:{id:u.id,username:u.username,role:u.role}});});
-app.get('/api/auth/me',authM,function(r,s){s.json({username:AU,role:'admin'});});
-app.get('/api/dashboard/stats',authM,function(r,s){s.json({totalVPS:db.prepare('SELECT COUNT(*)as c FROM vps').get().c,totalCores:db.prepare('SELECT COALESCE(SUM(cpu_cores),0)as c FROM vps').get().c,totalRAM:db.prepare('SELECT COALESCE(SUM(ram_mb),0)as c FROM vps').get().c,totalStorage:db.prepare('SELECT COALESCE(SUM(storage_gb),0)as c FROM vps').get().c});});
-app.get('/api/dashboard/status-overview',authM,function(r,s){s.json({running:db.prepare("SELECT COUNT(*)as c FROM vps WHERE status='running'").get().c,stopped:db.prepare("SELECT COUNT(*)as c FROM vps WHERE status='stopped'").get().c,suspended:db.prepare("SELECT COUNT(*)as c FROM vps WHERE status='suspended'").get().c});});
-app.get('/api/dashboard/resource-usage',authM,function(r,s){var n=new Date(),p=[];for(var i=23;i>=0;i--){var t=new Date(n-i*3600000);p.push({hour:String(t.getHours()).padStart(2,'0')+':00',cpu:Math.max(0,Math.min(100,25+Math.sin(i*0.5)*18+Math.random()*15)),ram:Math.max(0,Math.min(100,40+Math.cos(i*0.3)*12+Math.random()*10)),disk:Math.max(0,Math.min(100,35+i*0.4+Math.random()*5)),network:Math.max(0,Math.min(100,15+Math.sin(i*0.7)*20+Math.random()*18))});}s.json(p);});
-app.get('/api/admin/nodes',authM,function(r,s){s.json(db.prepare('SELECT*FROM nodes ORDER BY id').all());});
-app.post('/api/admin/nodes',authM,function(r,s){var b=r.body,info=db.prepare('INSERT INTO nodes(name,address,port,max_ram_mb,max_disk_gb,max_cpu)VALUES(?,?,?,?,?,?)').run(b.name,b.address,b.port||8081,b.max_ram_mb||0,b.max_disk_gb||0,b.max_cpu||0);logA(AU,'create_node','Added node: '+b.name,r.ip);s.json({id:info.lastInsertRowid});});
-app.get('/api/admin/activity',authM,function(r,s){var pg=parseInt(r.query.page)||1,lm=15,off=(pg-1)*lm,tot=db.prepare('SELECT COUNT(*)as c FROM activity_log').get().c;var rows=db.prepare('SELECT*FROM activity_log ORDER BY id DESC LIMIT?OFFSET?').all(lm,off);s.json({rows:rows,total:tot,pages:Math.ceil(tot/lm),page:pg});});
-app.get('/api/admin/users',authM,function(r,s){var us=db.prepare('SELECT id,username,email,role,created_at FROM users ORDER BY id').all();s.json(us.map(function(u){return Object.assign({},u,{vps_count:db.prepare('SELECT COUNT(*)as c FROM vps WHERE owner_id=?').get(u.id).c});}));});
-app.post('/api/admin/users',authM,function(r,s){var b=r.body;if(!b.username||!b.password)return s.status(400).json({error:'Username and password required'});if(db.prepare('SELECT id FROM users WHERE username=?').get(b.username))return s.status(409).json({error:'Username exists'});var info=db.prepare('INSERT INTO users(username,password,email,role)VALUES(?,?,?,?)').run(b.username,bcrypt.hashSync(b.password,10),b.email||'',b.role||'user');logA(AU,'create_user','Created user: '+b.username,r.ip);s.json({id:info.lastInsertRowid});});
-app.delete('/api/admin/users/:id',authM,function(r,s){var uid=parseInt(r.params.id);if(uid===1)return s.status(403).json({error:'Cannot delete primary admin'});db.prepare('UPDATE vps SET owner_id=NULL WHERE owner_id=?').run(uid);db.prepare('DELETE FROM users WHERE id=?').run(uid);logA(AU,'delete_user','Deleted user #'+uid,r.ip);s.json({message:'Deleted'});});
-app.put('/api/admin/users/:id/assign-vps',authM,function(r,s){var uid=parseInt(r.params.id),vids=r.body.vps_ids||[];db.prepare('UPDATE vps SET owner_id=NULL WHERE owner_id=?').run(uid);var asgn=db.prepare('UPDATE vps SET owner_id=?WHERE id=?');for(var i=0;i<vids.length;i++)asgn.run(uid,vids[i]);logA(AU,'assign_vps','Assigned VPS to user #'+uid,r.ip);s.json({message:'Assigned'});});
-app.get('/api/vps',authM,function(r,s){s.json(db.prepare('SELECT v.*,m.cpu_usage,m.ram_usage,m.disk_usage,m.network_in,m.network_out,u.username as owner_name FROM vps v LEFT JOIN metrics m ON m.id=(SELECT id FROM metrics WHERE vps_id=v.id ORDER BY id DESC LIMIT 1) LEFT JOIN users u ON u.id=v.owner_id ORDER BY v.id DESC').all());});
-app.post('/api/vps',authM,function(r,s){var b=r.body,info=db.prepare('INSERT INTO vps(name,hostname,ip_address,os,cpu_cores,ram_mb,storage_gb,node_id,owner_id)VALUES(?,?,?,?,?,?,?,?,?)').run(b.name,b.hostname||'',b.ip_address,b.os||'Ubuntu 22.04',b.cpu_cores||1,b.ram_mb||1024,b.storage_gb||20,b.node_id||1,b.owner_id||null);db.prepare('UPDATE nodes SET vps_count=vps_count+1 WHERE id=?').run(b.node_id||1);logA(AU,'create_vps','Created VPS: '+b.name,r.ip);s.json({id:info.lastInsertRowid});});
-app.put('/api/vps/:id/status',authM,function(r,s){var st=r.body.status,v=db.prepare('SELECT name FROM vps WHERE id=?').get(r.params.id);db.prepare('UPDATE vps SET status=?WHERE id=?').run(st,r.params.id);if(st==='stopped')db.prepare('UPDATE metrics SET cpu_usage=0,ram_usage=0 WHERE vps_id=?').run(r.params.id);logA(AU,st+'_vps',st.charAt(0).toUpperCase()+st.slice(1)+' VPS: '+(v?v.name:''),r.ip);s.json({message:'Updated'});});
-app.delete('/api/vps/:id',authM,function(r,s){var v=db.prepare('SELECT name,node_id FROM vps WHERE id=?').get(r.params.id);db.prepare('DELETE FROM metrics WHERE vps_id=?').run(r.params.id);db.prepare('DELETE FROM vps WHERE id=?').run(r.params.id);if(v)db.prepare('UPDATE nodes SET vps_count=MAX(0,vps_count-1)WHERE id=?').run(v.node_id);logA(AU,'delete_vps','Deleted VPS: '+(v?v.name:''),r.ip);s.json({message:'Deleted'});});
-app.get('*',function(r,s){s.sendFile(path.join(__dirname,'public','index.html'));});
-app.listen(PORT,'0.0.0.0',function(){console.log('  CPH-Panel v2.0 running on port '+PORT);});
-SRVEOF
-sed -i "s/__APPHOLDER__/${ADMIN_PASS}/g" "$PANEL_DIR/server.js"
 
-cat > "$PANEL_DIR/public/index.html" << 'HTMLEOF'
-<!DOCTYPE html>
-<html lang="en">
-<head>
-<meta charset="UTF-8">
-<meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>CPH-Panel</title>
-<link rel="preconnect" href="https://fonts.googleapis.com">
-<link href="https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@400;500;600;700&display=swap" rel="stylesheet">
-<link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.5.1/css/all.min.css">
-<style>
-:root{--bg:#000;--bgc:#0a0a0a;--bgch:#111;--bgs:#050505;--bd:#1a1a1a;--bdl:#222;--fg:#fff;--fm:#888;--fd:#555;--bl:#2563eb;--blh:#1d4ed8;--blg:rgba(37,99,235,.15);--gn:#22c55e;--gnb:rgba(34,197,94,.08);--gnbd:rgba(34,197,94,.2);--yw:#eab308;--ywb:rgba(234,179,8,.08);--ywbd:rgba(234,179,8,.2);--gy:#6b7280;--gyb:rgba(107,114,128,.08);--gybd:rgba(107,114,128,.2);--rd:#ef4444;--rdb:rgba(239,68,68,.08);--rdbd:rgba(239,68,68,.2);--pr:#a78bfa;--prb:rgba(167,139,250,.1);--sw:260px;--r:10px;--rs:6px}
-*,*::before,*::after{box-sizing:border-box;margin:0;padding:0}html{font-size:15px}body{font-family:'Space Grotesk',sans-serif;background:var(--bg);color:var(--fg);min-height:100vh;overflow-x:hidden;-webkit-font-smoothing:antialiased}::-webkit-scrollbar{width:5px}::-webkit-scrollbar-track{background:transparent}::-webkit-scrollbar-thumb{background:#222;border-radius:3px}
-.app{display:flex;min-height:100vh}.side{width:var(--sw);min-height:100vh;background:var(--bgs);border-right:1px solid var(--bd);display:flex;flex-direction:column;position:fixed;top:0;left:0;bottom:0;z-index:100;transition:transform .3s}.sb{padding:26px 22px 18px;border-bottom:1px solid var(--bd)}.sb h1{font-size:1.3rem;font-weight:700;letter-spacing:-.02em}.sb span{font-size:.65rem;color:var(--fd);text-transform:uppercase;letter-spacing:.12em;display:block;margin-top:3px}.sn{flex:1;padding:14px 10px;display:flex;flex-direction:column;gap:1px;overflow-y:auto}.nl{font-size:.62rem;text-transform:uppercase;letter-spacing:.14em;color:var(--fd);padding:18px 12px 7px;user-select:none}.ni{display:flex;align-items:center;gap:11px;padding:9px 13px;border-radius:var(--rs);color:var(--fm);text-decoration:none;font-size:.85rem;font-weight:500;cursor:pointer;transition:all .15s;border:1px solid transparent}.ni:hover{background:var(--bgc);color:var(--fg)}.ni.ac{background:var(--blg);color:var(--bl);border-color:rgba(37,99,235,.12)}.ni i{width:18px;text-align:center;font-size:.88rem}.sf{padding:14px;border-top:1px solid var(--bd)}.su{display:flex;align-items:center;gap:10px;padding:10px;border-radius:var(--rs);background:var(--bgc)}.sa{width:32px;height:32px;border-radius:50%;background:var(--bl);display:flex;align-items:center;justify-content:center;font-size:.75rem;font-weight:700;color:#fff;flex-shrink:0}.suna{font-size:.8rem;font-weight:600;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}.suro{font-size:.66rem;color:var(--fd)}.mc{flex:1;margin-left:var(--sw);min-height:100vh;padding:34px 38px 60px;position:relative}.mc::before{content:'';position:fixed;top:0;left:var(--sw);right:0;bottom:0;background:radial-gradient(ellipse 80% 50% at 50% 0%,rgba(37,99,235,.03) 0%,transparent 70%);pointer-events:none;z-index:0}.mc>*{position:relative;z-index:1}
-.wh{margin-bottom:30px}.wh h2{font-size:1.7rem;font-weight:700;letter-spacing:-.03em;margin-bottom:5px}.wh p{color:var(--fm);font-size:.88rem}
-.sg{display:grid;grid-template-columns:repeat(4,1fr);gap:14px;margin-bottom:18px}.sc{background:var(--bgc);border:1px solid var(--bd);border-radius:var(--r);padding:20px 22px;transition:all .2s;position:relative;overflow:hidden}.sc:hover{border-color:var(--bdl);background:var(--bgch)}.sc::after{content:'';position:absolute;top:0;left:0;right:0;height:1px;background:linear-gradient(90deg,transparent,rgba(37,99,235,.3),transparent);opacity:0;transition:opacity .3s}.sc:hover::after{opacity:1}.sci{width:36px;height:36px;border-radius:var(--rs);background:var(--blg);display:flex;align-items:center;justify-content:center;margin-bottom:14px;color:var(--bl);font-size:.9rem}.scl{font-size:.72rem;color:var(--fm);text-transform:uppercase;letter-spacing:.08em;margin-bottom:7px;font-weight:500}.scv{font-size:1.8rem;font-weight:700;letter-spacing:-.03em;line-height:1}.scu{font-size:.82rem;font-weight:500;color:var(--fm);margin-left:3px}
-.bg{display:grid;grid-template-columns:1fr 1.6fr;gap:14px}.pn{background:var(--bgc);border:1px solid var(--bd);border-radius:var(--r);padding:22px;transition:border-color .2s}.pn:hover{border-color:var(--bdl)}.pnt{font-size:.92rem;font-weight:600;margin-bottom:18px;display:flex;align-items:center;gap:8px}.pnt i{color:var(--fd);font-size:.82rem}
-.sl{display:flex;flex-direction:column;gap:12px}.sr{display:flex;align-items:center;justify-content:space-between;padding:13px 15px;border-radius:var(--rs);border:1px solid var(--bd);background:var(--bg);transition:background .15s}.sr:hover{background:var(--bgch)}.srl{display:flex;align-items:center;gap:11px}.sdot{width:10px;height:10px;border-radius:50%;flex-shrink:0}.sdot.running{background:var(--gn);box-shadow:0 0 8px rgba(34,197,94,.4)}.sdot.stopped{background:var(--gy)}.sdot.suspended{background:var(--yw);box-shadow:0 0 8px rgba(234,179,8,.3)}.srlb{font-size:.86rem;font-weight:500}.src{font-size:1.2rem;font-weight:700}.src.running{color:var(--gn)}.src.stopped{color:var(--gy)}.src.suspended{color:var(--yw)}.sbar{height:4px;background:var(--bd);border-radius:2px;margin-top:5px;overflow:hidden}.sfill{height:100%;border-radius:2px;transition:width .8s}.sfill.running{background:var(--gn)}.sfill.stopped{background:var(--gy)}.sfill.suspended{background:var(--yw)}
-.gg{display:grid;grid-template-columns:1fr 1fr;gap:14px}.gb{background:var(--bg);border:1px solid var(--bd);border-radius:var(--rs);padding:14px;transition:border-color .15s}.gb:hover{border-color:var(--bdl)}.gbh{display:flex;align-items:center;justify-content:space-between;margin-bottom:10px}.gbl{font-size:.76rem;font-weight:500;color:var(--fm)}.gbv{font-size:.83rem;font-weight:700}.gbv.cv{color:var(--bl)}.gbv.rv{color:var(--gn)}.gbv.dv{color:var(--yw)}.gbv.nv{color:var(--pr)}.gc{width:100%;height:78px;display:block}
-.ph{display:flex;align-items:center;justify-content:space-between;margin-bottom:22px}.ph h2{font-size:1.35rem;font-weight:700;letter-spacing:-.02em;display:flex;align-items:center;gap:8px}.ph h2 i{color:var(--fd);font-size:1rem}
-.btn{display:inline-flex;align-items:center;gap:7px;padding:8px 16px;border-radius:var(--rs);font-family:inherit;font-size:.8rem;font-weight:600;border:none;cursor:pointer;transition:all .15s;text-decoration:none;outline:none}.btn:focus-visible{outline:2px solid var(--bl);outline-offset:2px}.bp{background:var(--bl);color:#fff}.bp:hover{background:var(--blh)}.bg_{background:transparent;color:var(--fm);border:1px solid var(--bd)}.bg_:hover{background:var(--bgc);color:var(--fg);border-color:var(--bdl)}.bs{padding:5px 11px;font-size:.73rem}.bd{background:var(--rdb);color:var(--rd);border:1px solid var(--rdbd)}.bd:hover{background:var(--rd);color:#fff}.bst{background:var(--gnb);color:var(--gn);border:1px solid var(--gnbd)}.bst:hover{background:var(--gn);color:#fff}.bsp{background:var(--gyb);color:var(--gy);border:1px solid var(--gybd)}.bsp:hover{background:var(--gy);color:#fff}.bsu{background:var(--ywb);color:var(--yw);border:1px solid var(--ywbd)}.bsu:hover{background:var(--yw);color:#000}
-.tw{background:var(--bgc);border:1px solid var(--bd);border-radius:var(--r);overflow:hidden}.vt{width:100%;border-collapse:collapse}.vt th{text-align:left;padding:13px 18px;font-size:.68rem;text-transform:uppercase;letter-spacing:.1em;color:var(--fd);font-weight:600;border-bottom:1px solid var(--bd);background:var(--bg)}.vt td{padding:13px 18px;font-size:.83rem;border-bottom:1px solid var(--bd);vertical-align:middle}.vt tr:last-child td{border-bottom:none}.vt tr:hover td{background:var(--bgch)}.vn{font-weight:600}.vi{font-family:'Space Grotesk',monospace;color:var(--fm);font-size:.78rem}.bdg{display:inline-flex;align-items:center;gap:5px;padding:3px 9px;border-radius:20px;font-size:.7rem;font-weight:600;text-transform:capitalize}.bdg-running{background:var(--gnb);color:var(--gn);border:1px solid var(--gnbd)}.bdg-stopped{background:var(--gyb);color:var(--gy);border:1px solid var(--gybd)}.bdg-suspended{background:var(--ywb);color:var(--yw);border:1px solid var(--ywbd)}.bdg-online{background:var(--gnb);color:var(--gn);border:1px solid var(--gnbd)}.bdg-offline{background:var(--rdb);color:var(--rd);border:1px solid var(--rdbd)}.bdd{width:6px;height:6px;border-radius:50%;background:currentColor}.acts{display:flex;gap:5px;flex-wrap:wrap}.mbt{width:55px;height:4px;background:var(--bd);border-radius:2px;overflow:hidden;display:inline-block;vertical-align:middle;margin-right:5px}.mbf{height:100%;border-radius:2px}.mbf.cpu{background:var(--bl)}.mbf.ram{background:var(--gn)}.mbf.disk{background:var(--yw)}.mvl{font-size:.73rem;color:var(--fm);font-weight:500}
-.ng{display:grid;grid-template-columns:repeat(auto-fill,minmax(340px,1fr));gap:14px;margin-bottom:28px}.nc{background:var(--bgc);border:1px solid var(--bd);border-radius:var(--r);padding:22px;transition:border-color .2s}.nc:hover{border-color:var(--bdl)}.nch{display:flex;align-items:center;justify-content:space-between;margin-bottom:18px}.ncn{font-size:1rem;font-weight:700;display:flex;align-items:center;gap:8px}.ncn i{color:var(--fd);font-size:.85rem}.nca{font-size:.72rem;color:var(--fd);font-family:'Space Grotesk',monospace;margin-top:2px}.ncs{display:grid;grid-template-columns:1fr 1fr;gap:12px}.nsi{background:var(--bg);border:1px solid var(--bd);border-radius:var(--rs);padding:12px 14px}.nsl{font-size:.68rem;color:var(--fd);text-transform:uppercase;letter-spacing:.08em;margin-bottom:6px;font-weight:500}.nsv{font-size:1.05rem;font-weight:700}.nsb{height:3px;background:var(--bd);border-radius:2px;margin-top:6px;overflow:hidden}.nsf{height:100%;border-radius:2px;transition:width .8s}.nsf.ramf{background:var(--gn)}.nsf.diskf{background:var(--yw)}.nsf.cpuf{background:var(--bl)}
-.at{width:100%;border-collapse:collapse}.at th{text-align:left;padding:12px 16px;font-size:.68rem;text-transform:uppercase;letter-spacing:.1em;color:var(--fd);font-weight:600;border-bottom:1px solid var(--bd);background:var(--bg)}.at td{padding:11px 16px;font-size:.82rem;border-bottom:1px solid var(--bd)}.at tr:last-child td{border-bottom:none}.at tr:hover td{background:var(--bgch)}.acu{font-weight:600;color:var(--bl)}.aca{color:var(--fm)}.act{color:var(--fg);font-weight:500}.acip{font-family:'Space Grotesk',monospace;font-size:.76rem;color:var(--fd)}.actm{color:var(--fd);font-size:.78rem;white-space:nowrap}.acico{width:28px;height:28px;border-radius:50%;display:inline-flex;align-items:center;justify-content:center;font-size:.7rem;flex-shrink:0}.acico.login{background:var(--blg);color:var(--bl)}.acico.create_vps,.acico.create_node,.acico.create_user{background:var(--gnb);color:var(--gn)}.acico.delete_vps,.acico.delete_user{background:var(--rdb);color:var(--rd)}.acico.start_vps{background:var(--gnb);color:var(--gn)}.acico.stop_vps{background:var(--gyb);color:var(--gy)}.acico.suspend_vps{background:var(--ywb);color:var(--yw)}.acico.restart_vps{background:var(--blg);color:var(--bl)}.acico.assign_vps{background:var(--prb);color:var(--pr)}.acico.default{background:var(--gyb);color:var(--gy)}.pg{display:flex;align-items:center;justify-content:center;gap:6px;margin-top:18px}.pgb{width:34px;height:34px;display:flex;align-items:center;justify-content:center;border-radius:var(--rs);background:var(--bgc);border:1px solid var(--bd);color:var(--fm);font-size:.8rem;font-weight:600;cursor:pointer;transition:all .15s;font-family:inherit}.pgb:hover{background:var(--bgch);color:var(--fg);border-color:var(--bdl)}.pgb.active{background:var(--bl);color:#fff;border-color:var(--bl)}.pgb:disabled{opacity:.3;cursor:not-allowed}
-.ovp{display:flex;flex-wrap:wrap;gap:4px;margin-top:6px}.ovt{font-size:.65rem;padding:2px 7px;border-radius:10px;background:var(--blg);color:var(--bl);border:1px solid rgba(37,99,235,.15)}
-.lp{display:flex;align-items:center;justify-content:center;min-height:100vh;padding:20px}.lc{width:100%;max-width:400px;background:var(--bgc);border:1px solid var(--bd);border-radius:var(--r);padding:38px 34px}.ll{text-align:center;margin-bottom:30px}.ll h1{font-size:1.55rem;font-weight:700;letter-spacing:-.03em}.ll p{font-size:.76rem;color:var(--fd);margin-top:3px}.fg{margin-bottom:16px}.fg label{display:block;font-size:.76rem;font-weight:500;color:var(--fm);margin-bottom:5px}.fi{width:100%;padding:9px 13px;background:var(--bg);border:1px solid var(--bd);border-radius:var(--rs);color:var(--fg);font-family:inherit;font-size:.86rem;outline:none;transition:border-color .15s}.fi:focus{border-color:var(--bl)}.fi::placeholder{color:var(--fd)}select.fi{cursor:pointer}.le{background:var(--rdb);border:1px solid var(--rdbd);color:var(--rd);padding:9px 13px;border-radius:var(--rs);font-size:.78rem;margin-bottom:14px;display:none}.lb{width:100%;padding:10px;margin-top:6px;font-size:.86rem}
-.mo{position:fixed;top:0;left:0;right:0;bottom:0;background:rgba(0,0,0,.7);backdrop-filter:blur(4px);z-index:200;display:none;align-items:center;justify-content:center;padding:20px}.mo.active{display:flex}.md{width:100%;max-width:500px;background:var(--bgc);border:1px solid var(--bd);border-radius:var(--r);padding:26px;animation:mdi .2s ease;max-height:90vh;overflow-y:auto}@keyframes mdi{from{opacity:0;transform:scale(.95) translateY(10px)}to{opacity:1;transform:scale(1) translateY(0)}}.md h3{font-size:1.05rem;font-weight:700;margin-bottom:18px}.mda{display:flex;gap:9px;justify-content:flex-end;margin-top:22px}.fr{display:grid;grid-template-columns:1fr 1fr;gap:11px}.md p{color:var(--fm);font-size:.82rem}
-.tc{position:fixed;top:18px;right:18px;z-index:300;display:flex;flex-direction:column;gap:7px}.tst{background:var(--bgc);border:1px solid var(--bd);border-radius:var(--rs);padding:11px 16px;font-size:.8rem;font-weight:500;display:flex;align-items:center;gap:9px;animation:ti .3s ease,to .3s ease 2.7s forwards;min-width:250px}.tst.success{border-left:3px solid var(--gn)}.tst.error{border-left:3px solid var(--rd)}.tst.info{border-left:3px solid var(--bl)}@keyframes ti{from{opacity:0;transform:translateX(40px)}to{opacity:1;transform:translateX(0)}}@keyframes to{from{opacity:1}to{opacity:0;transform:translateX(40px)}}
-.sk{background:linear-gradient(90deg,#111 25%,#1a1a1a 50%,#111 75%);background-size:200% 100%;animation:shim 1.5s infinite;border-radius:var(--rs)}@keyframes shim{0%{background-position:200% 0}100%{background-position:-200% 0}}.skc{height:105px}.skp{height:290px}
-.pv{animation:pi .25s ease}@keyframes pi{from{opacity:0;transform:translateY(7px)}to{opacity:1;transform:translateY(0)}}
-@media(max-width:1200px){.sg{grid-template-columns:repeat(2,1fr)}.bg{grid-template-columns:1fr}.gg{grid-template-columns:1fr 1fr}}
-@media(max-width:768px){.side{transform:translateX(-100%)}.side.open{transform:translateX(0)}.mc{margin-left:0;padding:22px 14px 40px}.sg{grid-template-columns:1fr}.gg{grid-template-columns:1fr}.ng{grid-template-columns:1fr}.vt th,.vt td,.at th,.at td{padding:9px 10px}.fr{grid-template-columns:1fr}.mtb{display:flex!important}}
-.mtb{display:none;position:fixed;top:14px;left:14px;z-index:150;width:38px;height:38px;background:var(--bgc);border:1px solid var(--bd);border-radius:var(--rs);align-items:center;justify-content:center;color:var(--fg);cursor:pointer;font-size:.95rem}
-@media(prefers-reduced-motion:reduce){*,*::before,*::after{animation-duration:.01ms!important;transition-duration:.01ms!important}}
-</style>
-</head>
-<body>
-<div class="tc" id="tc"></div>
-<button class="mtb" id="mtb" aria-label="Menu"><i class="fas fa-bars"></i></button>
-<div id="lpg" class="lp" style="display:none">
-<div class="lc">
-<div class="ll"><h1>CPH-Panel</h1><p>VPS Hosting Control Panel</p></div>
-<div class="le" id="ler">Invalid username or password</div>
-<form id="lfr" autocomplete="off">
-<div class="fg"><label>Username</label><input class="fi" type="text" id="lun" placeholder="Enter username" required></div>
-<div class="fg"><label>Password</label><input class="fi" type="password" id="lpw" placeholder="Enter password" required></div>
-<button type="submit" class="btn bp lb">Sign In</button>
-</form>
-</div>
-</div>
-<div id="ash" class="app" style="display:none">
-<aside class="side" id="sid">
-<div class="sb"><h1>CPH-Panel</h1><span>Hosting Control Panel</span></div>
-<nav class="sn">
-<div class="nl">Main</div>
-<a class="ni ac" data-p="dashboard" href="#"><i class="fas fa-th-large"></i> Dashboard</a>
-<a class="ni" data-p="vps" href="#"><i class="fas fa-server"></i> VPS Management</a>
-<div class="nl">Administration</div>
-<a class="ni" data-p="admin" href="#"><i class="fas fa-shield-halved"></i> Administration</a>
-<div class="nl">System</div>
-<a class="ni" data-p="settings" href="#"><i class="fas fa-cog"></i> Settings</a>
-<a class="ni" id="lob" href="#"><i class="fas fa-sign-out-alt"></i> Logout</a>
-</nav>
-<div class="sf"><div class="su"><div class="sa" id="sav">A</div><div><div class="suna" id="sunm">admin</div><div class="suro">Administrator</div></div></div></div>
-</aside>
-<main class="mc" id="mct"></main>
-</div>
-<div class="mo" id="cvm"><div class="md"><h3>Create New VPS</h3><form id="cvf"><div class="fg"><label>VPS Name</label><input class="fi" type="text" name="name" placeholder="My VPS" required></div><div class="fr"><div class="fg"><label>Hostname</label><input class="fi" type="text" name="hostname" placeholder="vps1.example.com"></div><div class="fg"><label>IP Address</label><input class="fi" type="text" name="ip_address" placeholder="10.0.0.100" required></div></div><div class="fg"><label>Operating System</label><select class="fi" name="os"><option value="Ubuntu 22.04">Ubuntu 22.04</option><option value="Ubuntu 24.04">Ubuntu 24.04</option><option value="Debian 12">Debian 12</option><option value="CentOS 9">CentOS 9</option><option value="AlmaLinux 9">AlmaLinux 9</option></select></div><div class="fr"><div class="fg"><label>CPU Cores</label><select class="fi" name="cpu_cores"><option value="1">1 Core</option><option value="2" selected>2 Cores</option><option value="4">4 Cores</option><option value="8">8 Cores</option><option value="16">16 Cores</option></select></div><div class="fg"><label>RAM (MB)</label><select class="fi" name="ram_mb"><option value="512">512 MB</option><option value="1024">1 GB</option><option value="2048" selected>2 GB</option><option value="4096">4 GB</option><option value="8192">8 GB</option><option value="16384">16 GB</option></select></div></div><div class="fr"><div class="fg"><label>Storage (GB)</label><select class="fi" name="storage_gb"><option value="20">20 GB</option><option value="40">40 GB</option><option value="60">60 GB</option><option value="80" selected>80 GB</option><option value="100">100 GB</option><option value="200">200 GB</option></select></div><div class="fg"><label>Node</label><select class="fi" name="node_id" id="cvn"></select></div></div><div class="mda"><button type="button" class="btn bg_" onclick="clM('cvm')">Cancel</button><button type="submit" class="btn bp">Create VPS</button></div></form></div></div>
-<div class="mo" id="cum"><div class="md"><h3>Create New User</h3><form id="cuf"><div class="fg"><label>Username</label><input class="fi" type="text" name="username" placeholder="username" required></div><div class="fg"><label>Password</label><input class="fi" type="password" name="password" placeholder="Strong password" required></div><div class="fg"><label>Email (optional)</label><input class="fi" type="email" name="email" placeholder="user@example.com"></div><div class="fg"><label>Role</label><select class="fi" name="role"><option value="user">User</option><option value="admin">Admin</option></select></div><div class="mda"><button type="button" class="btn bg_" onclick="clM('cum')">Cancel</button><button type="submit" class="btn bp">Creat
-cat > /etc/systemd/system/cph-panel.service << SVCEOF
-[Unit]
-Description=CPH-Panel VPS Hosting Control Panel
-After=network.target
-[Service]
-Type=simple
-User=${PANEL_USER}
-Group=${PANEL_USER}
-WorkingDirectory=${PANEL_DIR}
-ExecStart=/usr/bin/node ${PANEL_DIR}/server.js
-Restart=on-failure
-RestartSec=5
-Environment=NODE_ENV=production
-Environment=CPH_PORT=${PANEL_PORT}
-Environment=CPH_SECRET=${PANEL_SECRET}
-[Install]
-WantedBy=multi-user.target
-SVCEOF
-echo -e "${CYAN}[5/6] Installing npm packages...${NC}"
-cd "$PANEL_DIR" && npm install --production 2>&1 | tail -3
-chown -R "$PANEL_USER:$PANEL_USER" "$PANEL_DIR"
-echo -e "${CYAN}[6/6] Starting CPH-Panel...${NC}"
-systemctl daemon-reload
-systemctl enable cph-panel >/dev/null 2>&1
-systemctl start cph-panel
-sleep 2
-if systemctl is-active --quiet cph-panel; then
-echo ""
-echo -e "${GREEN}╔══════════════════════════════════════════════════════════════╗${NC}"
-echo -e "${GREEN}║          CPH-Panel v2.0 installed successfully!            ║${NC}"
-echo -e "${GREEN}╠══════════════════════════════════════════════════════════════╣${NC}"
-echo -e "${GREEN}║${NC}  URL: http://$(hostname -I 2>/dev/null | awk '{print $1}' || echo 'YOUR_IP'):${PANEL_PORT}   ${GREEN}║${NC}"
-echo -e "${GREEN}║${NC}  User: ${ADMIN_USER}                                             ${GREEN}║${NC}"
-echo -e "${GREEN}║${NC}  Pass: ${ADMIN_PASS}   ${GREEN}║${NC}"
-echo -e "${GREEN}║${NC}  ${YELLOW}Save these credentials!${NC}                                ${GREEN}║${NC}"
-echo -e "${GREEN}╚══════════════════════════════════════════════════════════════╝${NC}"
-else
-echo -e "${RED}Failed to start. Check: journalctl -u cph-panel -n 30${NC}"; exit 1
+# cph-panel Auto Installer
+echo "========================================"
+echo "      Installing cph-panel              "
+echo "========================================"
+
+# Check if Node.js is installed
+if ! command -v node &> /dev/null; then
+    echo "Node.js is not installed. Please install Node.js v18+ first."
+    exit 1
 fi
+
+# Create Vite React project
+echo "Creating Vite React project..."
+npm create vite@latest cph-panel -- --template react
+cd cph-panel
+
+# Install dependencies
+echo "Installing dependencies..."
+npm install
+npm install @supabase/supabase-js recharts
+npm install -D tailwindcss postcss autoprefixer
+
+# Initialize Tailwind CSS
+echo "Configuring Tailwind CSS..."
+npx tailwindcss init -p
+
+# Configure Tailwind config
+cat << 'EOF' > tailwind.config.js
+/** @type {import('tailwindcss').Config} */
+export default {
+  content: [
+    "./index.html",
+    "./src/**/*.{js,ts,jsx,tsx}",
+  ],
+  theme: {
+    extend: {},
+  },
+  plugins: [],
+}
+EOF
+
+# Configure Global CSS
+cat << 'EOF' > src/index.css
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+body {
+  background-color: #000000;
+  color: #ffffff;
+}
+EOF
+
+# Create directories
+mkdir -p src/lib
+mkdir -p src/components
+
+# Create Supabase Client (Dynamic to read from localStorage first, then .env)
+cat << 'EOF' > src/lib/supabaseClient.js
+import { createClient } from '@supabase/supabase-js';
+
+const getSupabaseConfig = () => {
+  // Check if keys were saved from the Admin Backend UI
+  const localStorageUrl = localStorage.getItem('cph_supabase_url');
+  const localStorageKey = localStorage.getItem('cph_supabase_anon_key');
+  
+  return {
+    url: localStorageUrl || import.meta.env.VITE_SUPABASE_URL,
+    key: localStorageKey || import.meta.env.VITE_SUPABASE_ANON_KEY
+  };
+};
+
+let { url, key } = getSupabaseConfig();
+
+// Fallback to prevent crash if not configured yet
+export const supabase = createClient(url || 'https://placeholder.supabase.co', key || 'placeholder-anon-key');
+EOF
+
+# Create .env file placeholder (optional now, as it can be set via UI)
+cat << 'EOF' > .env
+# You can set keys here, OR directly in the Admin Backend UI of the panel
+VITE_SUPABASE_URL=
+VITE_SUPABASE_ANON_KEY=
+EOF
+
+# 1. Create Auth Component
+cat << 'EOF' > src/components/Auth.jsx
+import { useState } from 'react';
+import { supabase } from '../lib/supabaseClient';
+
+export default function Auth() {
+  const [email, setEmail] = useState('');
+  const [password, setPassword] = useState('');
+  const [username, setUsername] = useState('');
+  const [isLogin, setIsLogin] = useState(true);
+
+  const handleAuth = async (e) => {
+    e.preventDefault();
+    if (isLogin) {
+      const { error } = await supabase.auth.signInWithPassword({ email, password });
+      if (error) alert(error.message);
+    } else {
+      const { error } = await supabase.auth.signUp({ 
+        email, 
+        password, 
+        options: { data: { username } } 
+      });
+      if (error) alert(error.message);
+    }
+  };
+
+  return (
+    <div className="min-h-screen bg-black flex items-center justify-center">
+      <div className="bg-zinc-900 p-8 rounded-lg w-96 border border-zinc-800">
+        <h2 className="text-white text-2xl mb-6 text-center font-normal">
+          {isLogin ? 'Login to cph-panel' : 'Sign up for cph-panel'}
+        </h2>
+        <form onSubmit={handleAuth} className="space-y-4">
+          {!isLogin && (
+            <input
+              type="text"
+              placeholder="Username"
+              value={username}
+              onChange={(e) => setUsername(e.target.value)}
+              className="w-full bg-black text-white border border-zinc-700 p-2 rounded focus:border-blue-500 outline-none"
+              required
+            />
+          )}
+          <input
+            type="email"
+            placeholder="Email"
+            value={email}
+            onChange={(e) => setEmail(e.target.value)}
+            className="w-full bg-black text-white border border-zinc-700 p-2 rounded focus:border-blue-500 outline-none"
+            required
+          />
+          <input
+            type="password"
+            placeholder="Password"
+            value={password}
+            onChange={(e) => setPassword(e.target.value)}
+            className="w-full bg-black text-white border border-zinc-700 p-2 rounded focus:border-blue-500 outline-none"
+            required
+          />
+          <button
+            type="submit"
+            className="w-full bg-blue-600 hover:bg-blue-700 text-white p-2 rounded transition-colors"
+          >
+            {isLogin ? 'Login' : 'Sign Up'}
+          </button>
+        </form>
+        <button
+          onClick={() => setIsLogin(!isLogin)}
+          className="text-blue-500 mt-4 text-sm w-full text-center hover:underline"
+        >
+          {isLogin ? 'Need an account? Sign up' : 'Already have an account? Login'}
+        </button>
+      </div>
+    </div>
+  );
+}
+EOF
+
+# 2. Create User Dashboard Component
+cat << 'EOF' > src/components/UserDashboard.jsx
+import { LineChart, Line, XAxis, YAxis, ResponsiveContainer, Tooltip } from 'recharts';
+
+export default function UserDashboard({ user, vpsData }) {
+  const totalVps = vpsData.length;
+  const totalCpu = vpsData.reduce((sum, vps) => sum + vps.cpu_cores, 0);
+  const totalRam = vpsData.reduce((sum, vps) => sum + vps.ram_mb, 0);
+  const totalStorage = vpsData.reduce((sum, vps) => sum + vps.storage_gb, 0);
+  const cpuGraphData = [{name: '1m', cpu: 20}, {name: '2m', cpu: 45}, {name: '3m', cpu: 30}, {name: '4m', cpu: 60}];
+
+  return (
+    <div className="p-6 bg-black text-white min-h-screen">
+      <h1 className="text-3xl font-normal mb-8">Welcome {user?.username}</h1>
+      
+      <div className="grid grid-cols-1 md:grid-cols-4 gap-4 mb-8">
+        <div className="bg-zinc-900 p-4 rounded-lg border border-zinc-800">
+          <p className="text-zinc-400 text-sm">Total VPS</p>
+          <p className="text-2xl">{totalVps}</p>
+        </div>
+        <div className="bg-zinc-900 p-4 rounded-lg border border-zinc-800">
+          <p className="text-zinc-400 text-sm">CPU Cores</p>
+          <p className="text-2xl">{totalCpu}</p>
+        </div>
+        <div className="bg-zinc-900 p-4 rounded-lg border border-zinc-800">
+          <p className="text-zinc-400 text-sm">Total RAM</p>
+          <p className="text-2xl">{totalRam} MB</p>
+        </div>
+        <div className="bg-zinc-900 p-4 rounded-lg border border-zinc-800">
+          <p className="text-zinc-400 text-sm">Storage</p>
+          <p className="text-2xl">{totalStorage} GB</p>
+        </div>
+      </div>
+
+      <div className="grid grid-cols-1 md:grid-cols-2 gap-6">
+        <div className="bg-zinc-900 p-6 rounded-lg border border-zinc-800">
+          <h3 className="text-xl mb-4 font-normal">VPS Status Overview</h3>
+          <div className="flex justify-around items-center mt-8">
+            <div className="text-center">
+              <div className="w-4 h-4 bg-green-500 rounded-full mx-auto mb-2"></div>
+              <p>Running: {vpsData.filter(v => v.status === 'running').length}</p>
+            </div>
+            <div className="text-center">
+              <div className="w-4 h-4 bg-gray-500 rounded-full mx-auto mb-2"></div>
+              <p>Stopped: {vpsData.filter(v => v.status === 'stopped').length}</p>
+            </div>
+            <div className="text-center">
+              <div className="w-4 h-4 bg-yellow-500 rounded-full mx-auto mb-2"></div>
+              <p>Suspended: {vpsData.filter(v => v.status === 'suspended').length}</p>
+            </div>
+          </div>
+        </div>
+
+        <div className="bg-zinc-900 p-6 rounded-lg border border-zinc-800">
+          <h3 className="text-xl mb-4 font-normal">Resource Usage (CPU)</h3>
+          <ResponsiveContainer width="100%" height={150}>
+            <LineChart data={cpuGraphData}>
+              <XAxis dataKey="name" stroke="#666" />
+              <YAxis stroke="#666" />
+              <Tooltip contentStyle={{ backgroundColor: '#000', border: '1px solid #333' }} />
+              <Line type="monotone" dataKey="cpu" stroke="#3b82f6" strokeWidth={2} />
+            </LineChart>
+          </ResponsiveContainer>
+        </div>
+      </div>
+    </div>
+  );
+}
+EOF
+
+# 3. Create My VPS Component
+cat << 'EOF' > src/components/MyVps.jsx
+import { useState } from 'react';
+
+export default function MyVps({ vps }) {
+  const [activeTab, setActiveTab] = useState('overview');
+  const [status, setStatus] = useState(vps.status);
+
+  const handleAction = (action) => {
+    if (action === 'start') setStatus('running');
+    if (action === 'stop') setStatus('stopped');
+    if (action === 'restart') setStatus('running');
+  };
+
+  return (
+    <div className="p-6 bg-black text-white min-h-screen">
+      <div className="bg-zinc-900 p-4 rounded-lg border border-zinc-800 flex justify-between items-center mb-6">
+        <div>
+          <h2 className="text-xl font-normal">{vps.vps_name}</h2>
+          <p className="text-zinc-400 text-sm">ID: {vps.id} | Created: {new Date(vps.created_at).toLocaleDateString()}</p>
+        </div>
+        <div className="space-x-2">
+          {status === 'running' ? (
+            <button onClick={() => handleAction('stop')} className="bg-blue-600 hover:bg-blue-700 px-4 py-2 rounded">Stop</button>
+          ) : (
+            <button onClick={() => handleAction('start')} className="bg-blue-600 hover:bg-blue-700 px-4 py-2 rounded">Start</button>
+          )}
+          <button onClick={() => handleAction('restart')} className="bg-blue-600 hover:bg-blue-700 px-4 py-2 rounded">Restart</button>
+          <button className="bg-blue-600 hover:bg-blue-700 px-4 py-2 rounded">Console</button>
+        </div>
+      </div>
+
+      <div className="grid grid-cols-2 md:grid-cols-4 gap-4 mb-6">
+        <div className="bg-zinc-900 p-4 rounded border border-zinc-800">
+          <p className="text-zinc-400 text-sm">CPU Cores</p>
+          <p className="text-xl">{vps.cpu_cores}</p>
+        </div>
+        <div className="bg-zinc-900 p-4 rounded border border-zinc-800">
+          <p className="text-zinc-400 text-sm">RAM Usage</p>
+          <p className="text-xl">{vps.ram_mb} MB</p>
+        </div>
+        <div className="bg-zinc-900 p-4 rounded border border-zinc-800">
+          <p className="text-zinc-400 text-sm">Storage Usage</p>
+          <p className="text-xl">{vps.storage_gb} GB</p>
+        </div>
+        <div className="bg-zinc-900 p-4 rounded border border-zinc-800">
+          <p className="text-zinc-400 text-sm">Network IP</p>
+          <p className="text-xl">{vps.ip_address}</p>
+        </div>
+      </div>
+
+      <div className="border-b border-zinc-800 mb-4">
+        <nav className="flex space-x-4">
+          {['overview', 'performance', 'backup', 'settings'].map(tab => (
+            <button
+              key={tab}
+              onClick={() => setActiveTab(tab)}
+              className={`py-2 px-4 capitalize ${activeTab === tab ? 'text-blue-500 border-b-2 border-blue-500' : 'text-zinc-400 hover:text-white'}`}
+            >
+              {tab}
+            </button>
+          ))}
+        </nav>
+      </div>
+
+      <div className="bg-zinc-900 p-4 rounded border border-zinc-800 min-h-[200px]">
+        {activeTab === 'overview' && <p>VPS Overview Details...</p>}
+        {activeTab === 'performance' && <p>Performance Graphs...</p>}
+        {activeTab === 'backup' && <p>Backup Management...</p>}
+        {activeTab === 'settings' && <p>VPS Settings...</p>}
+      </div>
+    </div>
+  );
+}
+EOF
+
+# 4. Create Port Forwarding Component
+cat << 'EOF' > src/components/PortForwarding.jsx
+import { useState } from 'react';
+import { supabase } from '../lib/supabaseClient';
+
+export default function PortForwarding({ vpsId }) {
+  const [ports, setPorts] = useState([]);
+  const [external, setExternal] = useState('');
+  const [internal, setInternal] = useState('');
+
+  const addPort = async (e) => {
+    e.preventDefault();
+    const { data, error } = await supabase
+      .from('port_forwarding')
+      .insert({ vps_id: vpsId, external_port: external, internal_port: internal })
+      .select();
+    
+    if (!error) setPorts([...ports, data[0]]);
+    setExternal(''); setInternal('');
+  };
+
+  return (
+    <div className="p-6 bg-black text-white min-h-screen">
+      <h2 className="text-2xl font-normal mb-6">Port Forwarding</h2>
+      
+      <form onSubmit={addPort} className="bg-zinc-900 p-4 rounded-lg border border-zinc-800 mb-6 flex space-x-4">
+        <input 
+          type="number" 
+          placeholder="External Port" 
+          value={external}
+          onChange={(e) => setExternal(e.target.value)}
+          className="bg-black border border-zinc-700 p-2 rounded flex-1 outline-none focus:border-blue-500"
+          required
+        />
+        <input 
+          type="number" 
+          placeholder="Internal Port" 
+          value={internal}
+          onChange={(e) => setInternal(e.target.value)}
+          className="bg-black border border-zinc-700 p-2 rounded flex-1 outline-none focus:border-blue-500"
+          required
+        />
+        <button type="submit" className="bg-blue-600 hover:bg-blue-700 px-6 py-2 rounded">Forward Port</button>
+      </form>
+
+      <div className="bg-zinc-900 p-4 rounded-lg border border-zinc-800">
+        <table className="w-full text-left">
+          <thead className="border-b border-zinc-800">
+            <tr>
+              <th className="py-2">External Port</th>
+              <th className="py-2">Internal Port</th>
+              <th className="py-2">Action</th>
+            </tr>
+          </thead>
+          <tbody>
+            {ports.length === 0 ? (
+              <tr><td colSpan="3" className="py-4 text-center text-zinc-500">No ports forwarded yet.</td></tr>
+            ) : (
+              ports.map((p, i) => (
+                <tr key={i} className="border-b border-zinc-800">
+                  <td className="py-2">{p.external_port}</td>
+                  <td className="py-2">{p.internal_port}</td>
+                  <td><button className="text-red-500 hover:underline">Delete</button></td>
+                </tr>
+              ))
+            )}
+          </tbody>
+        </table>
+      </div>
+    </div>
+  );
+}
+EOF
+
+# 5. Create Admin Dashboard Component
+cat << 'EOF' > src/components/AdminDashboard.jsx
+export default function AdminDashboard({ stats, health }) {
+  return (
+    <div className="p-6 bg-black text-white min-h-screen">
+      <h1 className="text-3xl font-normal mb-8">Admin Dashboard</h1>
+      
+      <div className="grid grid-cols-1 md:grid-cols-4 gap-4 mb-8">
+        <div className="bg-zinc-900 p-4 rounded-lg border border-zinc-800">
+          <p className="text-zinc-400 text-sm">Total Users</p>
+          <p className="text-2xl">{stats.totalUsers}</p>
+        </div>
+        <div className="bg-zinc-900 p-4 rounded-lg border border-zinc-800">
+          <p className="text-zinc-400 text-sm">Total VPS</p>
+          <p className="text-2xl">{stats.totalVps}</p>
+        </div>
+        <div className="bg-zinc-900 p-4 rounded-lg border border-zinc-800">
+          <p className="text-zinc-400 text-sm">Suspended VPS</p>
+          <p className="text-2xl">{stats.suspendedVps}</p>
+        </div>
+        <div className="bg-zinc-900 p-4 rounded-lg border border-zinc-800">
+          <p className="text-zinc-400 text-sm">Available Ports</p>
+          <p className="text-2xl">{stats.availablePorts}/{stats.totalPorts}</p>
+        </div>
+      </div>
+
+      <div className="grid grid-cols-1 md:grid-cols-2 gap-6">
+        <div className="bg-zinc-900 p-6 rounded-lg border border-zinc-800">
+          <h3 className="text-xl mb-4 font-normal">System Health (Main Node)</h3>
+          <div className="space-y-4">
+            <div>
+              <div className="flex justify-between mb-1"><span>CPU</span><span>{health.cpu}%</span></div>
+              <div className="w-full bg-black rounded-full h-2.5">
+                <div className="bg-blue-600 h-2.5 rounded-full" style={{width: `${health.cpu}%`}}></div>
+              </div>
+            </div>
+            <div>
+              <div className="flex justify-between mb-1"><span>RAM</span><span>{health.ram}%</span></div>
+              <div className="w-full bg-black rounded-full h-2.5">
+                <div className="bg-blue-600 h-2.5 rounded-full" style={{width: `${health.ram}%`}}></div>
+              </div>
+            </div>
+            <div>
+              <div className="flex justify-between mb-1"><span>Disk</span><span>{health.disk}%</span></div>
+              <div className="w-full bg-black rounded-full h-2.5">
+                <div className="bg-blue-600 h-2.5 rounded-full" style={{width: `${health.disk}%`}}></div>
+              </div>
+            </div>
+          </div>
+        </div>
+
+        <div className="bg-zinc-900 p-6 rounded-lg border border-zinc-800">
+          <h3 className="text-xl mb-4 font-normal">Quick Actions</h3>
+          <div className="grid grid-cols-2 gap-4">
+            <button className="bg-blue-600 hover:bg-blue-700 p-3 rounded">+ New VPS</button>
+            <button className="bg-blue-600 hover:bg-blue-700 p-3 rounded">Manage Users</button>
+            <button className="bg-blue-600 hover:bg-blue-700 p-3 rounded">Node Settings</button>
+            <button className="bg-blue-600 hover:bg-blue-700 p-3 rounded">System Logs</button>
+          </div>
+        </div>
+      </div>
+    </div>
+  );
+}
+EOF
+
+# 6. Create Admin Backend Component (Saves keys to localStorage dynamically)
+cat << 'EOF' > src/components/AdminBackend.jsx
+import { useState } from 'react';
+
+export default function AdminBackend() {
+  const [projectUrl, setProjectUrl] = useState(localStorage.getItem('cph_supabase_url') || '');
+  const [anonKey, setAnonKey] = useState(localStorage.getItem('cph_supabase_anon_key') || '');
+  const [secretKey, setSecretKey] = useState(localStorage.getItem('cph_supabase_secret_key') || '');
+
+  const saveConfig = (e) => {
+    e.preventDefault();
+    localStorage.setItem('cph_supabase_url', projectUrl);
+    localStorage.setItem('cph_supabase_anon_key', anonKey);
+    localStorage.setItem('cph_supabase_secret_key', secretKey);
+    alert('Supabase configuration saved! Reloading application to apply new keys...');
+    window.location.reload(); // Reload to re-initialize the Supabase client
+  };
+
+  return (
+    <div className="p-6 bg-black text-white min-h-screen">
+      <h2 className="text-2xl font-normal mb-6">Backend Configuration</h2>
+      <form onSubmit={saveConfig} className="bg-zinc-900 p-6 rounded-lg border border-zinc-800 max-w-2xl space-y-4">
+        <div>
+          <label className="block text-zinc-400 mb-1">Supabase Project URL</label>
+          <input 
+            type="url" 
+            value={projectUrl} 
+            onChange={(e) => setProjectUrl(e.target.value)}
+            className="w-full bg-black border border-zinc-700 p-2 rounded outline-none focus:border-blue-500"
+            placeholder="https://xyz.supabase.co"
+            required
+          />
+        </div>
+        <div>
+          <label className="block text-zinc-400 mb-1">Anon Key</label>
+          <input 
+            type="text" 
+            value={anonKey} 
+            onChange={(e) => setAnonKey(e.target.value)}
+            className="w-full bg-black border border-zinc-700 p-2 rounded outline-none focus:border-blue-500"
+            required
+          />
+        </div>
+        <div>
+          <label className="block text-zinc-400 mb-1">Secret Key (Service Role)</label>
+          <input 
+            type="password" 
+            value={secretKey} 
+            onChange={(e) => setSecretKey(e.target.value)}
+            className="w-full bg-black border border-zinc-700 p-2 rounded outline-none focus:border-blue-500"
+            required
+          />
+        </div>
+        <button type="submit" className="bg-blue-600 hover:bg-blue-700 px-6 py-2 rounded">
+          Connect & Save Configuration
+        </button>
+      </form>
+    </div>
+  );
+}
+EOF
+
+# 7. Create Main App.jsx (Real Auth & Role-based Sidebar)
+cat << 'EOF' > src/App.jsx
+import { useState, useEffect } from 'react';
+import { supabase } from './lib/supabaseClient';
+import Auth from './components/Auth';
+import UserDashboard from './components/UserDashboard';
+import MyVps from './components/MyVps';
+import PortForwarding from './components/PortForwarding';
+import AdminDashboard from './components/AdminDashboard';
+import AdminBackend from './components/AdminBackend';
+
+export default function App() {
+  const [session, setSession] = useState(null);
+  const [profile, setProfile] = useState(null);
+  const [view, setView] = useState('user_dashboard');
+
+  useEffect(() => {
+    // Get initial session
+    supabase.auth.getSession().then(({ data: { session } }) => {
+      setSession(session);
+      if (session) fetchProfile(session.user.id);
+    });
+
+    // Listen for auth changes
+    const { data: { subscription } } = supabase.auth.onAuthStateChange((_event, session) => {
+      setSession(session);
+      if (session) fetchProfile(session.user.id);
+      else setProfile(null);
+    });
+
+    return () => subscription.unsubscribe();
+  }, []);
+
+  const fetchProfile = async (userId) => {
+    const { data } = await supabase.from('profiles').select('*').eq('id', userId).single();
+    setProfile(data);
+  };
+
+  // Show Auth screen if not logged in
+  if (!session) return <Auth />;
+
+  // Check if user is Admin or Owner
+  const isAdmin = profile?.role === 'owner' || profile?.role === 'admin';
+
+  return (
+    <div className="flex min-h-screen bg-black text-white">
+      {/* Sidebar */}
+      <div className="w-64 bg-zinc-950 p-4 border-r border-zinc-800 hidden md:block">
+        <h1 className="text-xl font-bold text-blue-500 mb-6">cph-panel</h1>
+        <nav className="space-y-2">
+          <button onClick={() => setView('user_dashboard')} className={`block w-full text-left p-2 rounded ${view === 'user_dashboard' ? 'bg-zinc-800' : 'hover:bg-zinc-900'}`}>Dashboard</button>
+          <button onClick={() => setView('my_vps')} className={`block w-full text-left p-2 rounded ${view === 'my_vps' ? 'bg-zinc-800' : 'hover:bg-zinc-900'}`}>My VPS</button>
+          <button onClick={() => setView('port_forwarding')} className={`block w-full text-left p-2 rounded ${view === 'port_forwarding' ? 'bg-zinc-800' : 'hover:bg-zinc-900'}`}>Port Forwarding</button>
+          
+          {isAdmin && (
+            <>
+              <div className="pt-4 mt-4 border-t border-zinc-800 text-zinc-500 text-xs uppercase">Administration</div>
+              <button onClick={() => setView('admin_dashboard')} className={`block w-full text-left p-2 rounded ${view === 'admin_dashboard' ? 'bg-zinc-800' : 'hover:bg-zinc-900'}`}>Admin Dashboard</button>
+              <button onClick={() => setView('admin_backend')} className={`block w-full text-left p-2 rounded ${view === 'admin_backend' ? 'bg-zinc-800' : 'hover:bg-zinc-900'}`}>Backend Settings</button>
+            </>
+          )}
+          
+          <div className="pt-4 mt-4 border-t border-zinc-800">
+            <button onClick={() => supabase.auth.signOut()} className="block w-full text-left p-2 rounded text-red-500 hover:bg-zinc-900">Logout</button>
+          </div>
+        </nav>
+      </div>
+      
+      {/* Main Content */}
+      <div className="flex-1 overflow-auto">
+        {view === 'user_dashboard' && <UserDashboard user={profile} vpsData={[{id:'1', vps_name:'Test VPS', cpu_cores:2, ram_mb:2048, storage_gb:50, status:'running', created_at: Date.now()}]} />}
+        {view === 'my_vps' && <MyVps vps={{id:'1', vps_name:'Test VPS', cpu_cores:2, ram_mb:2048, storage_gb:50, ip_address:'192.168.1.1', status:'stopped', created_at: Date.now()}} />}
+        {view === 'port_forwarding' && <PortForwarding vpsId="1" />}
+        {view === 'admin_dashboard' && <AdminDashboard stats={{totalUsers: 1, totalVps: 1, suspendedVps: 0, availablePorts: 100, totalPorts: 100}} health={{cpu: 15, ram: 45, disk: 30}} />}
+        {view === 'admin_backend' && <AdminBackend />}
+      </div>
+    </div>
+  );
+}
+EOF
+
+# Clean up default Vite files
+rm -f src/App.css
+rm -f src/assets/react.svg
+
+# Update main.jsx to remove default App.css import
+cat << 'EOF' > src/main.jsx
+import { StrictMode } from 'react'
+import { createRoot } from 'react-dom/client'
+import App from './App.jsx'
+import './index.css'
+
+createRoot(document.getElementById('root')).render(
+  <StrictMode>
+    <App />
+  </StrictMode>,
+)
+EOF
+
+echo "========================================"
+echo "Installation Complete!"
+echo "========================================"
+echo "To start the panel:"
+echo "1. cd cph-panel"
+echo "2. Run: npm run dev"
+echo "3. Open http://localhost:5173"
+echo "4. Click 'Sign Up' and create your first account."
+echo "5. The FIRST account created automatically becomes the OWNER."
+echo "6. The Administration section will appear in your sidebar."
+echo "7. Go to Backend Settings to securely input your Supabase keys from the UI."
+echo "========================================"
