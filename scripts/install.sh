@@ -144,14 +144,15 @@ log "Environment config written"
 # ── Install dependencies ──────────────────────────────────────
 step "Installing Node.js dependencies..."
 cd "$PANEL_DIR"
-pnpm install --frozen-lockfile --silent 2>/dev/null || pnpm install --silent
+pnpm install --no-frozen-lockfile
 log "Dependencies installed"
 
 # ── Push database schema ──────────────────────────────────────
 step "Pushing database schema..."
 cd "$PANEL_DIR"
 DATABASE_URL="postgresql://$DB_USER:$DB_PASSWORD@localhost:5432/$DB_NAME" \
-  pnpm --filter @workspace/db run push --accept-data-loss 2>/dev/null || \
+  pnpm --filter @workspace/db run push --accept-data-loss || \
+  DATABASE_URL="postgresql://$DB_USER:$DB_PASSWORD@localhost:5432/$DB_NAME" \
   pnpm --filter @workspace/db run push
 log "Database schema applied"
 
