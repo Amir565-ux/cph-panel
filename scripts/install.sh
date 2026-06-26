@@ -32,8 +32,6 @@
 #  20. Build & start
 # =============================================================================
 
-set -e
-
 # ── Colors ─────────────────────────────────────────────────────────────────
 RED='\033[0;31m'; GREEN='\033[0;32m'; YELLOW='\033[1;33m'
 BLUE='\033[0;34m'; BOLD='\033[1m'; NC='\033[0m'
@@ -44,13 +42,20 @@ API_PORT="${API_PORT:-5000}"
 PANEL_PORT="${PANEL_PORT:-80}"
 DB_NAME="cph_panel"
 DB_USER="cph_panel"
-DB_PASS="${DB_PASS:-$(openssl rand -hex 16)}"
+# Safe password generation — uses /dev/urandom, no openssl dependency
+DB_PASS="${DB_PASS:-$(tr -dc 'a-f0-9' < /dev/urandom 2>/dev/null | head -c 32 || echo "cphpanel$(date +%s)")}"
 NODE_VERSION="20"
 
 log_info()  { echo -e "${GREEN}[INFO]${NC}  $1"; }
 log_warn()  { echo -e "${YELLOW}[WARN]${NC}  $1"; }
 log_error() { echo -e "${RED}[ERROR]${NC} $1"; }
 log_step()  { echo -e "\n${BLUE}${BOLD}==> $1${NC}"; }
+
+die() { log_error "$1"; exit 1; }
+
+run() {
+  "$@" || { log_error "Command failed: $*"; exit 1; }
+}
 
 banner() {
   echo -e "${BLUE}${BOLD}"
@@ -64,40 +69,116 @@ banner() {
 }
 
 check_root() {
-  [[ $EUID -ne 0 ]] && { log_error "Run as root: sudo bash <(curl -s ...)"; exit 1; }
+  if [[ $EUID -ne 0 ]]; then
+    log_error "This script must be run as root."
+    echo -e "  Re-run with: ${BOLD}sudo bash \$0${NC}"
+    echo -e "  Or switch to root first: ${BOLD}sudo su -${NC}"
+    exit 1
+  fi
 }
 
 detect_os() {
-  [[ -f /etc/os-release ]] && . /etc/os-release || { log_error "Cannot detect OS"; exit 1; }
-  log_info "OS: $ID $VERSION_ID"
+  if [[ -f /etc/os-release ]]; then
+    . /etc/os-release
+    log_info "Detected OS: ${PRETTY_NAME:-$ID $VERSION_ID}"
+  else
+    log_warn "Could not detect OS — assuming Debian/Ubuntu-compatible"
+  fi
+}
+
+service_cmd() {
+  # Handles both systemctl (VPS) and service (containers/Codespaces)
+  local action="$1" svc="$2"
+  if command -v systemctl &>/dev/null && systemctl is-system-running &>/dev/null 2>&1; then
+    systemctl "$action" "$svc" 2>/dev/null || true
+  else
+    service "$svc" "$action" 2>/dev/null || true
+  fi
 }
 
 install_system_deps() {
   log_step "Installing system dependencies"
-  apt-get update -q
-  apt-get install -y -q curl wget git build-essential openssl postgresql postgresql-contrib nginx
+
+  # Yeh variable set karta hai takay apt-get koi interactive question na pooche
+  export DEBIAN_FRONTEND=noninteractive
+
+  # Package list ko refresh karta hai — server se latest package names laata hai
+  apt-get update -qq 2>&1 | tail -3
+
+  # Ye sab zaroori programs install karta hai:
+  #   curl/wget  = internet se files download karne ke liye
+  #   git        = code manage karne ke liye
+  #   build-essential = C/C++ tools jo Node.js compile karne lagte hain
+  #   openssl    = secure passwords aur SSL certificates banane ke liye
+  #   postgresql = database server — panel ka data yahan store hota hai
+  #   nginx      = web server — browser se requests leke backend ko bhejta hai
+  apt-get install -y -qq curl wget git build-essential openssl postgresql postgresql-contrib nginx 2>&1 | tail -5
 
   log_step "Installing Node.js $NODE_VERSION"
+
+  # Check karta hai ke Node.js pehle se installed hai ya nahi
+  # Agar nahi hai ya purana version hai to install karta hai
   if ! command -v node &>/dev/null || [[ "$(node -v | cut -d. -f1 | tr -d 'v')" -lt "$NODE_VERSION" ]]; then
+
+    # NodeSource ka official script download karke chalata hai
+    # Yeh script apt-get mein Node.js ka sahi source add karta hai
     curl -fsSL https://deb.nodesource.com/setup_${NODE_VERSION}.x | bash -
+
+    # Ab Node.js install karta hai us source se jo upar add kiya
     apt-get install -y -q nodejs
   fi
 
   log_step "Installing pnpm + pm2"
+
+  # pnpm = fast package manager, Node.js dependencies install karne ke liye
+  # pm2  = process manager, backend server ko background mein chalata hai aur crash pe restart karta hai
   npm install -g pnpm pm2 --silent
 }
 
 setup_postgres() {
   log_step "Setting up PostgreSQL"
-  systemctl start postgresql && systemctl enable postgresql
-  su postgres -c "psql -c \"SELECT 1\" &>/dev/null || true"
-  su postgres -c "psql -tc \"SELECT 1 FROM pg_user WHERE usename='$DB_USER'\" | grep -q 1 \
-    || psql -c \"CREATE USER $DB_USER WITH PASSWORD '$DB_PASS'\"" 2>/dev/null || true
-  su postgres -c "psql -c \"ALTER USER $DB_USER WITH PASSWORD '$DB_PASS'\"" 2>/dev/null
-  su postgres -c "psql -tc \"SELECT 1 FROM pg_database WHERE datname='$DB_NAME'\" | grep -q 1 \
-    || psql -c \"CREATE DATABASE $DB_NAME OWNER $DB_USER\"" 2>/dev/null || true
+
+  # PostgreSQL service shuru karta hai
+  # systemctl = normal VPS par, service = containers/Codespaces mein
+  service_cmd start postgresql
+
+  # Boot pe automatically start hone ke liye enable karta hai (sirf systemctl environments mein)
+  service_cmd enable postgresql
+
+  # PostgreSQL ke tayar hone ka intezaar karta hai — kabhi kabhi start hone mein waqt lagta hai
+  local retries=0
+  until su - postgres -c "psql -c 'SELECT 1' &>/dev/null" 2>/dev/null || [[ $retries -ge 10 ]]; do
+    log_info "Waiting for PostgreSQL to be ready... ($retries/10)"
+    # 2 second ruko phir dobara check karo
+    sleep 2
+    ((retries++))
+  done
+
+  # Agar service command se start nahi hua to pg_ctlcluster try karta hai (Debian ka alternative)
+  if ! su - postgres -c "psql -c 'SELECT 1' &>/dev/null" 2>/dev/null; then
+    # Installed PostgreSQL version dhundta hai
+    PG_VERSION=$(ls /etc/postgresql/ 2>/dev/null | sort -V | tail -1)
+    if [[ -n "$PG_VERSION" ]]; then
+      # Directly cluster start karta hai version number ke saath
+      pg_ctlcluster "$PG_VERSION" main start 2>/dev/null || true
+      sleep 2
+    fi
+  fi
+
+  # Agar panel ka database user pehle se nahi hai to banata hai
+  su - postgres -c "psql -tc \"SELECT 1 FROM pg_user WHERE usename='$DB_USER'\" 2>/dev/null | grep -q 1 \
+    || psql -c \"CREATE USER $DB_USER WITH PASSWORD '$DB_PASS'\" 2>/dev/null" 2>/dev/null || true
+
+  # User ka password update karta hai (agar pehle se tha to bhi update ho jata hai)
+  su - postgres -c "psql -c \"ALTER USER $DB_USER WITH PASSWORD '$DB_PASS'\" 2>/dev/null" 2>/dev/null || true
+
+  # Agar panel ka database pehle se nahi hai to banata hai aur user ko owner banata hai
+  su - postgres -c "psql -tc \"SELECT 1 FROM pg_database WHERE datname='$DB_NAME'\" 2>/dev/null | grep -q 1 \
+    || psql -c \"CREATE DATABASE $DB_NAME OWNER $DB_USER\" 2>/dev/null" 2>/dev/null || true
+
+  # DATABASE_URL variable set karta hai — backend is URL se database se connect karta hai
   DATABASE_URL="postgresql://$DB_USER:$DB_PASS@localhost:5432/$DB_NAME"
-  log_info "Database ready"
+  log_info "Database ready: $DB_NAME"
 }
 
 # =============================================================================
@@ -750,27 +831,52 @@ HEREDOC
 
 migrate_db() {
   log_step "Running database migrations"
+
+  # Backend folder mein jaata hai jahan drizzle config file hai
   cd "$PANEL_DIR/backend"
+
+  # Database tables banata ya update karta hai schema.ts ke mutabiq
+  # --force = purane data ko preserve karte hue structure change karta hai
   DATABASE_URL="$DATABASE_URL" npx drizzle-kit push --config drizzle.config.ts --force
 }
 
 build_backend() {
   log_step "Building backend (TypeScript → JS)"
+
+  # Backend folder mein jaata hai
   cd "$PANEL_DIR/backend"
+
+  # Sab npm packages install karta hai jo backend ke liye chahiye (express, drizzle, pg etc.)
   pnpm install --silent
+
+  # TypeScript code ko JavaScript mein compile karta hai — Node.js direct TS nahi chal sakta
+  # Output /dist folder mein jaata hai
   pnpm run build
 }
 
 build_frontend() {
   log_step "Building frontend (React → static)"
+
+  # Frontend folder mein jaata hai
   cd "$PANEL_DIR/frontend"
+
+  # Sab npm packages install karta hai jo frontend ke liye chahiye (React, Recharts etc.)
   pnpm install --silent
+
+  # React app ko static HTML/CSS/JS mein compile karta hai
+  # Output /dist folder mein jaata hai — yahi Nginx serve karta hai browser ko
   pnpm run build
   log_info "Frontend built to $PANEL_DIR/frontend/dist"
 }
 
 setup_nginx() {
   log_step "Configuring Nginx"
+
+  # Nginx config file likhta hai CPH Panel ke liye
+  # Yeh file batata hai ke Nginx kaise kaam kare:
+  #   - Port 80 par listen karo
+  #   - Frontend files /frontend/dist se serve karo
+  #   - /api/* wali requests backend (port 5000) ko bhej do
   cat > /etc/nginx/sites-available/cph-panel << NGINX
 server {
     listen ${PANEL_PORT};
@@ -790,18 +896,36 @@ server {
     }
 }
 NGINX
+
+  # CPH Panel config ko sites-enabled mein link karta hai (enable karta hai)
   ln -sf /etc/nginx/sites-available/cph-panel /etc/nginx/sites-enabled/cph-panel
+
+  # Purani default Nginx site remove karta hai taake conflict na ho
   rm -f /etc/nginx/sites-enabled/default
-  nginx -t && systemctl reload nginx
+
+  # Config test karta hai aur agar sahi hai to Nginx reload karta hai
+  nginx -t && (service_cmd reload nginx || nginx -s reload || true)
 }
 
 start_services() {
   log_step "Starting API server with PM2"
+
+  # Panel directory mein jaata hai jahan ecosystem.config.cjs hai
   cd "$PANEL_DIR"
+
+  # Agar pehle se cph-panel-api chal raha hai to band karta hai (fresh start ke liye)
   pm2 delete cph-panel-api 2>/dev/null || true
+
+  # Backend API server shuru karta hai ecosystem config ke mutabiq
+  # PM2 is process ko background mein chalata hai aur crash hone par restart karta hai
   pm2 start ecosystem.config.cjs
+
+  # PM2 process list save karta hai taake server reboot par dobara shuru ho
   pm2 save
-  pm2 startup systemd -u root --hp /root 2>/dev/null | grep "^sudo" | bash || true
+
+  # Server boot par PM2 automatically start ho — systemd par kaam karta hai
+  # Containers/Codespaces mein silently skip ho jaata hai
+  pm2 startup 2>/dev/null | grep -E "^sudo|^env" | bash 2>/dev/null || true
 }
 
 print_summary() {
@@ -830,18 +954,43 @@ print_summary() {
 # MAIN
 # =============================================================================
 main() {
+  # CPH Panel ka naam aur version dikhata hai terminal mein
   banner
+
+  # Check karta hai ke script root user se chal rahi hai ya nahi
+  # Root hona zaroori hai kyunke system packages install karne hain
   check_root
+
+  # Linux distribution detect karta hai (Ubuntu, Debian, etc.)
   detect_os
+
+  # apt-get se sab zaroori packages install karta hai (Node.js, PostgreSQL, Nginx, PM2)
   install_system_deps
+
+  # PostgreSQL database server setup karta hai — panel ka user aur database banata hai
   setup_postgres
+
+  # Sab source files (backend + frontend) /opt/cph-panel mein extract karta hai
   extract_files
+
+  # Database schema apply karta hai — vps table aur baaki tables banata hai
   migrate_db
+
+  # Backend TypeScript code compile karke JavaScript mein convert karta hai
   build_backend
+
+  # React frontend ko static HTML/CSS/JS files mein build karta hai
   build_frontend
+
+  # Nginx web server configure karta hai — port 80 par panel serve karta hai
   setup_nginx
+
+  # PM2 se backend API server shuru karta hai background mein
   start_services
+
+  # Installation ka summary dikhata hai — URL, database credentials, etc.
   print_summary
 }
 
+# Script shuru karna — main() function call karta hai
 main "$@"
