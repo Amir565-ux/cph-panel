@@ -1,0 +1,13 @@
+source: https://github.com/willnode/wings.git
+features:
+- docker
+services: docker-compose.yml
+commands:
+  - cp -f docker-compose.example.yml docker-compose.yml
+  - 'sed -ri "s|TZ.*|DOCKER_MOUNT_BASE_PATH: $HOME|g" docker-compose.yml'
+  - sed -i "s|../var/run/docker.sock|/run/user/$(id -u)/docker.sock|g" docker-compose.yml
+  - mkdir -p ../etc/pterodactyl/ ../var/{lib,log}/pterodactyl/ ../tmp/pterodactyl/
+  - touch ../etc/pterodactyl/config.yml
+  - printf "Initial setup done! Please copy the config mentioned in your panel\n 
+     to ~/etc/pterodactyl/config.yml using SSH or Filemin\n 
+     and restart this by calling 'docker compose restart' in SSH\n"
